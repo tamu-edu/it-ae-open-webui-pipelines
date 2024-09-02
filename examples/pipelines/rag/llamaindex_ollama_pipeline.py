@@ -29,6 +29,7 @@ class Pipeline:
     def __init__(self):
         self.documents = None
         self.index = None
+        self.name = "TAMU System SAPs: llamaindex"
 
         self.valves = self.Valves(
             **{
