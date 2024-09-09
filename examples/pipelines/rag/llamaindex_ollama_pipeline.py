@@ -53,10 +53,32 @@ class Pipeline:
             base_url=self.valves.LLAMAINDEX_OLLAMA_BASE_URL,
         )
 
+        import os
+
+        # Define the folder path
+        folder_path = '/app/backend/data'
+        
+        # Check if the folder exists, if not, create it
+        if not os.path.exists('/app/backend'):
+            os.makedirs('/app/backend')
+
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+
+        # Define the file name and the text content
+        file_name = "example.txt"
+        text_content = "This is a simple text string."
+        
+        # Open the file in write mode and write the content
+        with open(file_name, 'w') as file:
+            file.write(text_content)
+
+# The file is automatically closed after the 'with' block
+
         # This function is called when the server is started.
         global documents, index
 
-        self.documents = SimpleDirectoryReader("/app/backend/data").load_data()
+        self.documents = SimpleDirectoryReader(folder_path).load_data()
         self.index = VectorStoreIndex.from_documents(self.documents)
         pass
 
