@@ -32,9 +32,11 @@ class Pipeline:
         # The identifier must be unique across all pipelines.
         # The identifier must be an alphanumeric string that can include underscores or hyphens. It cannot contain spaces, special characters, slashes, or backslashes.
         # self.id = "litellm_manifold"
+        self.id = ""
 
         # Optionally, you can set the name of the manifold pipeline.
-        self.name = "LiteLLM: "
+        #self.name = "LiteLLM: "
+        self.name = ""
 
         # Initialize rate limits
         self.valves = self.Valves(
