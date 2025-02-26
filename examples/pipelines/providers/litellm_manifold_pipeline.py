@@ -42,10 +42,10 @@ class Pipeline:
         self.valves = self.Valves(
             **{
                 "LITELLM_BASE_URL": os.getenv(
-                    "LITELLM_BASE_URL", "http://localhost:4001"
+                    "LITELLM_BASE_URL", "http://litellm-service:4000"
                 ),
-                "LITELLM_API_KEY": os.getenv("LITELLM_API_KEY", "your-api-key-here"),
-                "LITELLM_PIPELINE_DEBUG": os.getenv("LITELLM_PIPELINE_DEBUG", False),
+                "LITELLM_API_KEY": os.getenv("LITELLM_API_KEY", "sk-1234"),
+                "LITELLM_PIPELINE_DEBUG": os.getenv("LITELLM_PIPELINE_DEBUG", True),
             }
         )
         # Get models on initialization
