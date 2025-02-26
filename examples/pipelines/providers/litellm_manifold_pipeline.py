@@ -32,11 +32,11 @@ class Pipeline:
         # The identifier must be unique across all pipelines.
         # The identifier must be an alphanumeric string that can include underscores or hyphens. It cannot contain spaces, special characters, slashes, or backslashes.
         # self.id = "litellm_manifold"
-        self.id = ""
+        self.id = "protected"
 
         # Optionally, you can set the name of the manifold pipeline.
         #self.name = "LiteLLM: "
-        self.name = ""
+        self.name = "TAMU: "
 
         # Initialize rate limits
         self.valves = self.Valves(
@@ -44,7 +44,7 @@ class Pipeline:
                 "LITELLM_BASE_URL": os.getenv(
                     "LITELLM_BASE_URL", "http://litellm-service:4000"
                 ),
-                "LITELLM_API_KEY": os.getenv("LITELLM_API_KEY", "sk-1234"),
+                "LITELLM_API_KEY": os.getenv("LITELLM_API_KEY", "your-api-key"),
                 "LITELLM_PIPELINE_DEBUG": os.getenv("LITELLM_PIPELINE_DEBUG", True),
             }
         )
