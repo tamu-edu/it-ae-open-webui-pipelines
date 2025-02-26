@@ -114,9 +114,9 @@ class Pipeline:
 
         try:
             payload = {**body, "model": model_id, "user": body["user"]["id"]}
-            payload.pop("chat_id", None)
-            payload.pop("user", None)
-            payload.pop("title", None)
+            #payload.pop("chat_id", None)
+            #payload.pop("user", None)
+            #payload.pop("title", None)
 
             r = requests.post(
                 url=f"{self.valves.LITELLM_BASE_URL}/v1/chat/completions",
