@@ -5,7 +5,6 @@ date: 2025-05-01
 version: 1.0
 license: MIT
 description: A filter pipeline that passes guardrail errors back to open-webui.
-requirements: 
 environment_variables: 
 """
 
