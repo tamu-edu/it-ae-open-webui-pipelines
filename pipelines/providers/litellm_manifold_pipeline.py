@@ -106,10 +106,10 @@ class Pipeline:
     @staticmethod
     def parse_guardrail_response(response) -> str:
         # Find the guardrail content
-        content = None
-        message = response["error"]["message"]
-        print(f"Message: {message}")
-        content = json.loads(message)
+        #content = None
+        content = response["error"]["message"]
+        print(f"Message: {content}")
+        #content = json.loads(message)
         print("Content:")
         print(pformat(content))
         print("Content2:")
