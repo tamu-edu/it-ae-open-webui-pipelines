@@ -117,6 +117,9 @@ class Pipeline:
             return "Couldn't parse guardrail response"
         print("Content:")
         print(pformat(content))
+        print("Content2:")
+        print(pformat(content["bedrock_guardrail_response"]))
+        print("Content3:")
         message = f"{content['blockedResponse']}\n\n"
         assessments = content["assessments"]
         if "topicPolicy" in assessments:
