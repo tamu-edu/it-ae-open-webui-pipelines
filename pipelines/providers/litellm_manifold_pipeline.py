@@ -36,7 +36,7 @@ class Pipeline:
         self.id = "protected"
 
         # Optionally, you can set the name of the manifold pipeline.
-        #self.name = "LiteLLM: "
+        # self.name = "LiteLLM: "
         self.name = "TAMU: "
 
         # Initialize rate limits
@@ -102,8 +102,18 @@ class Pipeline:
             print("LITELLM_BASE_URL not set. Please configure it in the valves.")
             return []
 
-    @staticmethod    
+    @staticmethod
     def parse_guardrail_response(response) -> str:
+        # Find the guardrail content
+        content = None
+        for message in response["messages"]:
+            if message["role"] == "assistant" and "GUARDRAIL_INTERVENED" in message["content"]:
+                content = json.loads(message["content"])["error"]["message"]
+                break
+        if not content:
+            print("Couldn't parse guardrail response")
+            return "Couldn't parse guardrail response"
+        print(content)
         message = ""
 
     def pipe(
@@ -121,9 +131,9 @@ class Pipeline:
 
         try:
             payload = {**body, "model": model_id, "user": body["user"]["email"]}
-            #payload.pop("chat_id", None)
-            #payload.pop("user", None)
-            #payload.pop("title", None)
+            # payload.pop("chat_id", None)
+            # payload.pop("user", None)
+            # payload.pop("title", None)
 
             r = requests.post(
                 url=f"{self.valves.LITELLM_BASE_URL}/v1/chat/completions",
@@ -139,6 +149,8 @@ class Pipeline:
 
             if r.status_code == 400 and "Violated guardrail policy" in r.text:
                 print("Guardrail policy violated, skipping error raise")
+                message = self.parse_guardrail_response(body)
+                print(f"Guardrail message: {message}")
             else:
                 r.raise_for_status()
 
