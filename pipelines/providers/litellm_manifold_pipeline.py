@@ -111,9 +111,9 @@ class Pipeline:
         print(f"Message: {content}")
         #content = json.loads(message)
         print("Content:")
-        print(pformat(content))
+        print(content)
         print("Content2:")
-        print(pformat(content["bedrock_guardrail_response"]))
+        print(content["bedrock_guardrail_response"])
         print("Content3:")
         message = f"{content['blockedResponse']}\n\n"
         assessments = content["assessments"]
