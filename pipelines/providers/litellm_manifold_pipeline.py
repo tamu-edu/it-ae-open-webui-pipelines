@@ -108,13 +108,19 @@ class Pipeline:
         content = None
         for message in response["messages"]:
             if message["role"] == "assistant" and "GUARDRAIL_INTERVENED" in message["content"]:
-                content = json.loads(message["content"])["error"]["message"]
+                content = json.loads(message["content"])["error"]["message"]["bedrock_guardrail_response"]
                 break
         if not content:
             print("Couldn't parse guardrail response")
             return "Couldn't parse guardrail response"
         print(content)
-        message = ""
+        message = f"{content['blockedResponse']}\n\n"
+        assessments = content["assessments"]
+        if "topicPolicy" in assessments:
+            for topic in assessments["topicPolicy"]:
+                message += f"Topic: {topic['name']}\n"
+        
+        return message
 
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
