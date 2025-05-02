@@ -108,14 +108,14 @@ class Pipeline:
     def parse_guardrail_response(response) -> str:
         # Find the guardrail content
         #content = None
-        content = json.loads(json.dumps(ast.literal_eval(response["error"]["message"])))
+        content = json.loads(json.dumps(ast.literal_eval(response["error"]["message"])))["bedrock_guardrail_response"]
         print(f"Message: {content}")
         #content = json.loads(message)
-        print("Content:")
-        print(content)
-        print("Content2:")
-        print(content["bedrock_guardrail_response"])
-        print("Content3:")
+        #print("Content:")
+        #print(content)
+        #print("Content2:")
+        #print(content["bedrock_guardrail_response"])
+        #print("Content3:")
         message = f"{content['blockedResponse']}\n\n"
         assessments = content["assessments"]
         if "topicPolicy" in assessments:
