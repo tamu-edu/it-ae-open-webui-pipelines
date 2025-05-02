@@ -108,7 +108,8 @@ class Pipeline:
         content = None
         for message in response["messages"]:
             if message["role"] == "assistant" and "GUARDRAIL_INTERVENED" in message["content"]:
-                content = json.loads(message["content"])["error"]["message"]["bedrock_guardrail_response"]
+                #content = json.loads(message["content"])["error"]["message"]["bedrock_guardrail_response"]
+                content = json.loads(message["content"])["error"]["message"]
                 break
         if not content:
             print("Couldn't parse guardrail response")
