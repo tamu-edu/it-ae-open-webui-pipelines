@@ -7,6 +7,7 @@ license: MIT
 description: A manifold pipeline that uses LiteLLM.
 """
 
+import ast
 import json
 from pprint import pformat
 from pydantic import BaseModel
@@ -107,7 +108,7 @@ class Pipeline:
     def parse_guardrail_response(response) -> str:
         # Find the guardrail content
         #content = None
-        content = response["error"]["message"]
+        content = json.loads(json.dumps(ast.literal_eval(response["error"]["message"])))
         print(f"Message: {content}")
         #content = json.loads(message)
         print("Content:")
