@@ -7,10 +7,11 @@ license: MIT
 description: A manifold pipeline that uses LiteLLM.
 """
 
-from typing import List, Union, Generator, Iterator
-from schemas import OpenAIChatMessage
+import json
 from pydantic import BaseModel
 import requests
+from schemas import OpenAIChatMessage
+from typing import List, Union, Generator, Iterator
 import os
 
 
@@ -101,6 +102,10 @@ class Pipeline:
             print("LITELLM_BASE_URL not set. Please configure it in the valves.")
             return []
 
+    @staticmethod    
+    def parse_guardrail_response(response) -> str:
+        message = ""
+
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Union[str, Generator, Iterator]:
@@ -130,6 +135,7 @@ class Pipeline:
             print(f"Response status_code: {r.status_code}")
             print(f"Response text: {r.text}")
             print(f"Response body: {body}")
+            print(f"Response body json: {json.dumps(body, indent=2)}")
 
             if r.status_code == 400 and "Violated guardrail policy" in r.text:
                 print("Guardrail policy violated, skipping error raise")
