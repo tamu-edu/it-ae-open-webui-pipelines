@@ -108,6 +108,7 @@ class Pipeline:
         # Find the guardrail content
         content = None
         message = response["error"]["message"]
+        print(f"Message: {message}")
         content = json.loads(message)
         print("Content:")
         print(pformat(content))
