@@ -127,8 +127,12 @@ class Pipeline:
                 stream=True,
             )
 
-            print(f"Response: {r.status_code}")
-            print(f"Response: {r.text}")
+            print(f"Response status_code: {r.status_code}")
+            print(f"Response text: {r.text}")
+            print(f"Response body: {body}")
+
+            #if r.status_code == 400 and "Violated guardrail policy" in r.text:
+
 
             r.raise_for_status()
 
