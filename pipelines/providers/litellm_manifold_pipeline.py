@@ -113,6 +113,7 @@ class Pipeline:
         if not content:
             print("Couldn't parse guardrail response")
             return "Couldn't parse guardrail response"
+        print("Content:")
         print(content)
         message = f"{content['blockedResponse']}\n\n"
         assessments = content["assessments"]
