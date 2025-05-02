@@ -8,6 +8,7 @@ description: A manifold pipeline that uses LiteLLM.
 """
 
 import json
+from pprint import pformat
 from pydantic import BaseModel
 import requests
 from schemas import OpenAIChatMessage
@@ -115,7 +116,7 @@ class Pipeline:
             print("Couldn't parse guardrail response")
             return "Couldn't parse guardrail response"
         print("Content:")
-        print(content)
+        print(pformat(content))
         message = f"{content['blockedResponse']}\n\n"
         assessments = content["assessments"]
         if "topicPolicy" in assessments:
