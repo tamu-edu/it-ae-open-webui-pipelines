@@ -127,7 +127,11 @@ class Pipeline:
         return message
 
     @staticmethod
-    def create_guardrail_response(message) -> str:
+    def create_guardrail_response(guardrail_message, model_id, messages) -> str:
+        print(f"model_id: {model_id}")
+        print("messages:")
+        print(messages)
+        # Create a response object similar to the one returned by the API
         return {
             "id": f"chatcmpl-{''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(28))}",
             "created": int(time.time()),
@@ -139,7 +143,7 @@ class Pipeline:
                     "finish_reason": "stop",
                     "index": 0,
                     "message": {
-                        "content": message,
+                        "content": guardrail_message,
                         "role": "assistant",
                         "tool_calls": None,
                         "function_call": None,
@@ -206,9 +210,9 @@ class Pipeline:
                 print(f"Response body json: {json.dumps(r.json(), indent=2)}")
                 if "Violated guardrail policy" in r.text:
                     print("Guardrail policy violated, skipping error raise")
-                    message = self.parse_guardrail_response(r.json())
-                    print(f"Guardrail message: {message}")
-                    guardrail_response = self.create_guardrail_response(message)
+                    guardrail_message = self.parse_guardrail_response(r.json())
+                    print(f"Guardrail message: {guardrail_message}")
+                    guardrail_response = self.create_guardrail_response(guardrail_message, model_id, messages)
                     print("Guardrail response:")
                     print(pformat(guardrail_response))
                     return guardrail_response
