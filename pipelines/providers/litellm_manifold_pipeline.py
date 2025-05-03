@@ -120,7 +120,7 @@ class Pipeline:
         assessments = content["assessments"]
         for assessment in assessments:
             if "topicPolicy" in assessment:
-                for topic in assessment["topicPolicy"]:
+                for topic in assessment["topicPolicy"]['topics']:
                     if topic["action"] == "BLOCKED" and topic["detected"]:
                         message += f"Topic: {topic['name']}\n"
         
