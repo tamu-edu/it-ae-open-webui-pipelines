@@ -11,8 +11,11 @@ import ast
 import json
 from pprint import pformat
 from pydantic import BaseModel
+import random
 import requests
 from schemas import OpenAIChatMessage
+import string
+import time
 from typing import List, Union, Generator, Iterator
 import os
 
@@ -107,26 +110,68 @@ class Pipeline:
     @staticmethod
     def parse_guardrail_response(response) -> str:
         # Find the guardrail content
-        #content = None
-        content = json.loads(json.dumps(ast.literal_eval(response["error"]["message"])))["bedrock_guardrail_response"]
+        content = json.loads(
+            json.dumps(ast.literal_eval(response["error"]["message"]))
+        )["bedrock_guardrail_response"]
         print(f"Message: {content}")
-        #content = json.loads(message)
-        #print("Content:")
-        #print(content)
-        #print("Content2:")
-        #print(content["bedrock_guardrail_response"])
-        #print("Content3:")
         message = f"{content['blockedResponse']}\n\n"
         assessments = content["assessments"]
         print("Assessments:")
         print(assessments)
         for assessment in assessments:
             if "topicPolicy" in assessment:
-                for topic in assessment["topicPolicy"]['topics']:
+                for topic in assessment["topicPolicy"]["topics"]:
                     if topic["action"] == "BLOCKED" and topic["detected"]:
                         message += f"Topic: {topic['name']}\n"
-        
+
         return message
+
+    @staticmethod
+    def create_guardrail_response(message) -> str:
+        return {
+            "id": f"chatcmpl-{''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(28))}",
+            "created": int(time.time()),
+            "model": "ollama/llama3.2",
+            "object": "chat.completion",
+            "system_fingerprint": "fp_ee1d74bde0",
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "index": 0,
+                    "message": {
+                        "content": message,
+                        "role": "assistant",
+                        "tool_calls": None,
+                        "function_call": None,
+                    },
+                }
+            ],
+            "usage": {
+                "completion_tokens": 0,
+                "prompt_tokens": 0,
+                "total_tokens": 0,
+                "completion_tokens_details": {
+                    "accepted_prediction_tokens": 0,
+                    "audio_tokens": 0,
+                    "reasoning_tokens": 0,
+                    "rejected_prediction_tokens": 0,
+                },
+                "prompt_tokens_details": {"audio_tokens": 0, "cached_tokens": 0},
+            },
+            "service_tier": None,
+            "prompt_filter_results": [
+                {
+                    "prompt_index": 0,
+                    "content_filter_results": {
+                        "hate": {"filtered": False, "severity": "safe"},
+                        "jailbreak": {"filtered": False, "detected": False},
+                        "self_harm": {"filtered": False, "severity": "safe"},
+                        "sexual": {"filtered": False, "severity": "safe"},
+                        "violence": {"filtered": False, "severity": "safe"},
+                    }
+                }
+            ]
+        }
 
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
@@ -163,6 +208,10 @@ class Pipeline:
                     print("Guardrail policy violated, skipping error raise")
                     message = self.parse_guardrail_response(r.json())
                     print(f"Guardrail message: {message}")
+                    guardrail_response = self.create_guardrail_response(message)
+                    print("Guardrail response:")
+                    print(pformat(guardrail_response))
+                    return guardrail_response
             else:
                 r.raise_for_status()
 
