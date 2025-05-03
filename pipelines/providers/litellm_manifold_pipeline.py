@@ -133,7 +133,7 @@ class Pipeline:
         print(messages)
         # Create a response object similar to the one returned by the API
         return {
-            "id": f"chatcmpl-{''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(28))}",
+            "id": f"chatcmpl-{''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(29))}",
             "created": int(time.time()),
             "model": model_id,
             "object": "chat.completion",
@@ -200,7 +200,7 @@ class Pipeline:
                 url=f"{self.valves.LITELLM_BASE_URL}/v1/chat/completions",
                 json=payload,
                 headers=headers,
-                stream=True,
+                stream=False, #### PUT THIS BACK TO TRUE ####
             )
 
             print(f"Response status_code: {r.status_code}")
@@ -224,6 +224,8 @@ class Pipeline:
                 print(f"Response json (stream): {res}")
                 return res
             else:
+                print("Request body:")
+                print(pformat(payload))
                 print(f"Response text: {r.text}")
                 print(f"Response json: {r.json()}")
                 print(f"Response body json: {json.dumps(r.json(), indent=2)}")
