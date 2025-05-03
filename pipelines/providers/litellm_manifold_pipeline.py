@@ -192,6 +192,10 @@ class Pipeline:
 
         try:
             payload = {**body, "model": model_id, "user": body["user"]["email"]}
+            #### GET RID OF THIS ####
+            payload["stream"] = False
+            #### GET RID OF THIS ####
+
             # payload.pop("chat_id", None)
             # payload.pop("user", None)
             # payload.pop("title", None)
