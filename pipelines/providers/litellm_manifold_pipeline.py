@@ -169,6 +169,9 @@ class Pipeline:
             if body["stream"]:
                 return r.iter_lines()
             else:
+                print(f"Response text: {r.text}")
+                print(f"Response json: {r.json()}")
+                print(f"Response body json: {json.dumps(r.json(), indent=2)}")
                 return r.json()
         except Exception as e:
             return f"Error: {e}"
