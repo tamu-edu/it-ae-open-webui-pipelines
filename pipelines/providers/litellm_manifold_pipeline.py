@@ -219,13 +219,14 @@ class Pipeline:
             else:
                 r.raise_for_status()
 
+            print("Request body:")
+            print(pformat(payload))
+
             if body["stream"]:
                 res = r.iter_lines()
                 print(f"Response json (stream): {res}")
                 return res
             else:
-                print("Request body:")
-                print(pformat(payload))
                 print(f"Response text: {r.text}")
                 print(f"Response json: {r.json()}")
                 print(f"Response body json: {json.dumps(r.json(), indent=2)}")
