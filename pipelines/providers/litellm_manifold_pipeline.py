@@ -121,7 +121,8 @@ class Pipeline:
         for assessment in assessments:
             if "topicPolicy" in assessment:
                 for topic in assessment["topicPolicy"]:
-                    message += f"Topic: {topic['name']}\n"
+                    if topic["action"] == "BLOCKED" and topic["detected"]:
+                        message += f"Topic: {topic['name']}\n"
         
         return message
 
