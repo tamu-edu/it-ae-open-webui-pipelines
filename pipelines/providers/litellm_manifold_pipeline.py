@@ -118,6 +118,8 @@ class Pipeline:
         #print("Content3:")
         message = f"{content['blockedResponse']}\n\n"
         assessments = content["assessments"]
+        print("Assessments:")
+        print(assessments)
         for assessment in assessments:
             if "topicPolicy" in assessment:
                 for topic in assessment["topicPolicy"]['topics']:
