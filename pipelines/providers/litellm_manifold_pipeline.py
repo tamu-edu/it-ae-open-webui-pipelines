@@ -127,7 +127,7 @@ class Pipeline:
         return message
 
     @staticmethod
-    def create_guardrail_response(guardrail_message, model_id, messages) -> str:
+    def create_guardrail_response(guardrail_message, model_id, messages) -> dict:
         print(f"model_id: {model_id}")
         print("messages:")
         print(messages)
@@ -135,7 +135,7 @@ class Pipeline:
         return {
             "id": f"chatcmpl-{''.join(random.choice(string.ascii_uppercase + string.ascii_lowercase + string.digits) for _ in range(28))}",
             "created": int(time.time()),
-            "model": "ollama/llama3.2",
+            "model": model_id,
             "object": "chat.completion",
             "system_fingerprint": "fp_ee1d74bde0",
             "choices": [
@@ -147,7 +147,7 @@ class Pipeline:
                         "role": "assistant",
                         "tool_calls": None,
                         "function_call": None,
-                    },
+                    }
                 }
             ],
             "usage": {
@@ -158,9 +158,9 @@ class Pipeline:
                     "accepted_prediction_tokens": 0,
                     "audio_tokens": 0,
                     "reasoning_tokens": 0,
-                    "rejected_prediction_tokens": 0,
+                    "rejected_prediction_tokens": 0
                 },
-                "prompt_tokens_details": {"audio_tokens": 0, "cached_tokens": 0},
+                "prompt_tokens_details": {"audio_tokens": 0, "cached_tokens": 0}
             },
             "service_tier": None,
             "prompt_filter_results": [
@@ -171,7 +171,7 @@ class Pipeline:
                         "jailbreak": {"filtered": False, "detected": False},
                         "self_harm": {"filtered": False, "severity": "safe"},
                         "sexual": {"filtered": False, "severity": "safe"},
-                        "violence": {"filtered": False, "severity": "safe"},
+                        "violence": {"filtered": False, "severity": "safe"}
                     }
                 }
             ]
@@ -220,7 +220,9 @@ class Pipeline:
                 r.raise_for_status()
 
             if body["stream"]:
-                return r.iter_lines()
+                res = r.iter_lines()
+                print(f"Response json (stream): {res}")
+                return res
             else:
                 print(f"Response text: {r.text}")
                 print(f"Response json: {r.json()}")
