@@ -146,6 +146,9 @@ class Pipeline:
             payload.pop("user", None)
             payload.pop("title", None)
 
+            print("Payload for LiteLLM:")
+            pprint(payload)
+
             r = requests.post(
                 url=f"{self.valves.LITELLM_BASE_URL}/v1/chat/completions",
                 json=payload,
