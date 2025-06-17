@@ -148,6 +148,8 @@ class Pipeline:
 
             print("Payload for LiteLLM:")
             pprint(payload)
+            print("Headers for LiteLLM:")
+            pprint(headers)
 
             r = requests.post(
                 url=f"{self.valves.LITELLM_BASE_URL}/v1/chat/completions",
