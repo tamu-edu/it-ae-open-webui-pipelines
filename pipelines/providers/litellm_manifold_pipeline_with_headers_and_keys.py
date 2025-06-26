@@ -34,7 +34,8 @@ if os.environ.get("LITELLM_PIPELINE_DEBUG", "False").lower() in ["true", "1"]:
 
     HTTPConnection.debuglevel = 1
 
-# VIRTUAL_KEY_CACHE = {}
+VIRTUAL_KEY_CACHE = {}
+
 
 
 class Pipeline:
@@ -124,28 +125,6 @@ class Pipeline:
             print("LITELLM_BASE_URL not set. Please configure it in the valves.")
             return []
 
-    def change_user_budget(self, user_id: str, headers: dict, enabled: bool):
-        # Get the user's virtual key id
-        r = requests.get(
-            url=f"{self.valves.LITELLM_BASE_URL}/key/list?page=1&size=10&user_id={user_id}&return_full_object=false&include_team_keys=false&sort_order=desc",
-            headers=headers,
-        )
-        r.raise_for_status()
-        key_id = r.json()["keys"][0]
-        # Assign a budget to the user's key
-        r = requests.post(
-            url=f"{self.valves.LITELLM_BASE_URL}/key/update",
-            json={
-                "budget_id": (
-                    os.environ.get("LITELLM_USER_BUDGET_NAME") if enabled else None
-                ),
-                "key": key_id,
-                "user_id": user_id,
-            },
-            headers=headers,
-        )
-        r.raise_for_status()
-
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Union[str, Generator, Iterator]:
@@ -167,84 +146,77 @@ class Pipeline:
         #    headers["Authorization"] = f"Bearer {self.valves.LITELLM_API_KEY}"
 
         try:
-            # if body["user"]["email"] in VIRTUAL_KEY_CACHE:
-            #    virtual_key = VIRTUAL_KEY_CACHE[body["user"]["email"]]
-            # else:
-            user_budget_enabled = os.environ.get(
-                "LITELLM_USER_BUDGET_ENABLED"
-            ).lower() in ["true", "1"]
-            r_headers = {
-                "Authorization": f"Bearer {self.valves.LITELLM_API_KEY}",
-                "Content-Type": "application/json",
-            }
-            # Ensure the postgresql database exists
-            with psycopg2.connect(os.environ.get("DATABASE_URL")) as conn:
-                with conn.cursor() as cursor:
-                    create_table_query = """
-                        CREATE TABLE IF NOT EXISTS litellm_user_keys (
-                            username VARCHAR(50) NOT NULL,
-                            virtualKey TEXT NOT NULL,
-                            update_user BOOLEAN DEFAULT FALSE,
+            if body["user"]["email"] in VIRTUAL_KEY_CACHE:
+                virtual_key = VIRTUAL_KEY_CACHE[body["user"]["email"]]
+            else:
+                # Ensure the postgresql database exists
+                with psycopg2.connect(os.environ.get("DATABASE_URL")) as conn:
+                    with conn.cursor() as cursor:
+                        create_table_query = """
+                            CREATE TABLE IF NOT EXISTS litellm_user_keys (
+                                username VARCHAR(50) NOT NULL,
+                                virtualKey TEXT NOT NULL,
+                                update_user BOOLEAN DEFAULT FALSE,
                             CONSTRAINT pk_litellm_user_keys PRIMARY KEY (username)
                         );
-                    """
-                    cursor.execute(create_table_query)
-                    cursor.execute(
-                        "SELECT username, virtualKey, update_user FROM litellm_user_keys WHERE username = %s;",
-                        (body["user"]["email"],),
-                    )
-                    result = cursor.fetchone()
-                    if result:
-                        virtual_key = result[1]
-                        update_user = result[2]
-
-                        if update_user:
-                            r = requests.get(
-                                url=f"{self.valves.LITELLM_BASE_URL}/user/list?user_email={requests.utils.quote(body['user']['email'])}&page=1&page_size=25&sort_order=asc",
+                        """
+                        cursor.execute(create_table_query)
+                        cursor.execute(
+                            "SELECT username, virtualKey FROM litellm_user_keys WHERE username = %s;",
+                            (body["user"]["email"],),
+                        )
+                        result = cursor.fetchone()
+                        if result:
+                            virtual_key = result[1]
+                        else:
+                            r_headers = {
+                                "Authorization": f"Bearer {self.valves.LITELLM_API_KEY}",
+                                "Content-Type": "application/json",
+                            }
+                            # Create the internal user in LiteLLM
+                            r = requests.post(
+                                url=f"{self.valves.LITELLM_BASE_URL}/user/new",
+                                json={
+                                    "key_alias": "pipelines_generated_key",
+                                    # "budget_id": os.environ.get("LITELLM_USER_BUDGET_NAME"),
+                                    # "max_budget": os.environ.get("LITELLM_USER_BUDGET"),
+                                    "user_alias": body["user"]["email"],
+                                    "user_email": body["user"]["email"],
+                                    "user_role": "internal_user_viewer",
+                                },
                                 headers=r_headers,
                             )
                             r.raise_for_status()
-                            user_id = r.json()["users"][0]["user_id"]
-                            self.change_user_budget(
-                                user_id=user_id,
-                                headers=r_headers,
-                                enabled=user_budget_enabled,
-                            )
-                            cursor.execute(
-                                "UPDATE litellm_user_keys SET update_user = 'f' WHERE username = %s;",
-                                (body["user"]["email"],),
-                            )
-                    else:
-                        # Create the internal user in LiteLLM
-                        r = requests.post(
-                            url=f"{self.valves.LITELLM_BASE_URL}/user/new",
-                            json={
-                                "key_alias": "pipelines_generated_key",
-                                # "budget_id": os.environ.get("LITELLM_USER_BUDGET_NAME"),
-                                # "max_budget": os.environ.get("LITELLM_USER_BUDGET"),
-                                "user_alias": body["user"]["email"],
-                                "user_email": body["user"]["email"],
-                                "user_role": "internal_user_viewer",
-                            },
-                            headers=r_headers,
-                        )
-                        r.raise_for_status()
-                        res_json = r.json()
-                        print("Response from LiteLLM user creation:")
-                        pprint(res_json)
+                            res_json = r.json()
+                            print("Response from LiteLLM user creation:")
+                            pprint(res_json)
 
-                        if user_budget_enabled:
-                            self.change_user_budget(
-                                user_id=res_json["user_id"],
+                            # Get the user's virtual key id
+                            r = requests.get(
+                                url=f"{self.valves.LITELLM_BASE_URL}/key/list?page=1&size=10&user_id={res_json['user_id']}&return_full_object=false&include_team_keys=false&sort_order=desc",
                                 headers=r_headers,
-                                enabled=True,
                             )
-                        virtual_key = res_json["key"]
-                        cursor.execute(
-                            "INSERT INTO litellm_user_keys (username, virtualKey) VALUES (%s, %s) ON CONFLICT (username) DO UPDATE SET virtualKey = EXCLUDED.virtualKey;",
-                            (body["user"]["email"], virtual_key),
-                        )
-                # VIRTUAL_KEY_CACHE[body["user"]["email"]] = virtual_key
+                            r.raise_for_status()
+                            key_id = r.json()["keys"][0]
+                            # Assign a budget to the user's key
+                            r = requests.post(
+                                url=f"{self.valves.LITELLM_BASE_URL}/key/update",
+                                json={
+                                    "budget_id": os.environ.get(
+                                        "LITELLM_USER_BUDGET_NAME"
+                                    ),
+                                    "key": key_id,
+                                    "user_id": res_json["user_id"],
+                                },
+                                headers=r_headers,
+                            )
+                            r.raise_for_status()
+                            virtual_key = res_json["key"]
+                            cursor.execute(
+                                "INSERT INTO litellm_user_keys (username, virtualKey) VALUES (%s, %s) ON CONFLICT (username) DO UPDATE SET virtualKey = EXCLUDED.virtualKey;",
+                                (body["user"]["email"], virtual_key),
+                            )
+                VIRTUAL_KEY_CACHE[body["user"]["email"]] = virtual_key
 
             headers["Authorization"] = f"Bearer {virtual_key}"
 
