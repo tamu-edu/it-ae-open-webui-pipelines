@@ -37,13 +37,15 @@ if os.environ.get("LITELLM_PIPELINE_DEBUG", "False").lower() in ["true", "1"]:
 VIRTUAL_KEY_CACHE = {}
 
 
-
 class Pipeline:
 
     class Valves(BaseModel):
         LITELLM_BASE_URL: str = ""
         LITELLM_API_KEY: str = ""
         LITELLM_PIPELINE_DEBUG: bool = False
+        LITELLM_USER_BUDGET_NAME: str = ""
+        DATABASE_URL: str = ""
+        LITELLM_USER_BUDGET_PERIOD: str = "1d" 
 
     def __init__(self):
         # You can also set the pipelines that are available in this pipeline.
@@ -70,6 +72,13 @@ class Pipeline:
                 ),
                 "LITELLM_API_KEY": os.getenv("LITELLM_API_KEY", "your-api-key"),
                 "LITELLM_PIPELINE_DEBUG": os.getenv("LITELLM_PIPELINE_DEBUG", True),
+                "LITELLM_USER_BUDGET_NAME": os.getenv(
+                    "LITELLM_USER_BUDGET_NAME", "Default user budget"
+                ),
+                "DATABASE_URL": os.getenv("DATABASE_URL", ""),
+                "LITELLM_USER_BUDGET_PERIOD": os.getenv(
+                    "LITELLM_USER_BUDGET_PERIOD", "1d"
+                ),
             }
         )
         # Get models on initialization
@@ -150,7 +159,7 @@ class Pipeline:
                 virtual_key = VIRTUAL_KEY_CACHE[body["user"]["email"]]
             else:
                 # Ensure the postgresql database exists
-                with psycopg2.connect(os.environ.get("DATABASE_URL")) as conn:
+                with psycopg2.connect(self.valves.DATABASE_URL) as conn:
                     with conn.cursor() as cursor:
                         create_table_query = """
                             CREATE TABLE IF NOT EXISTS litellm_user_keys (
@@ -178,11 +187,10 @@ class Pipeline:
                                 url=f"{self.valves.LITELLM_BASE_URL}/user/new",
                                 json={
                                     "key_alias": "pipelines_generated_key",
-                                    # "budget_id": os.environ.get("LITELLM_USER_BUDGET_NAME"),
-                                    # "max_budget": os.environ.get("LITELLM_USER_BUDGET"),
                                     "user_alias": body["user"]["email"],
                                     "user_email": body["user"]["email"],
                                     "user_role": "internal_user_viewer",
+                                    "budget_duration": "1mo"
                                 },
                                 headers=r_headers,
                             )
@@ -202,11 +210,10 @@ class Pipeline:
                             r = requests.post(
                                 url=f"{self.valves.LITELLM_BASE_URL}/key/update",
                                 json={
-                                    "budget_id": os.environ.get(
-                                        "LITELLM_USER_BUDGET_NAME"
-                                    ),
+                                    "budget_id": self.valves.LITELLM_USER_BUDGET_NAME,
                                     "key": key_id,
                                     "user_id": res_json["user_id"],
+                                    "budget_duration": self.valves.LITELLM_USER_BUDGET_PERIOD
                                 },
                                 headers=r_headers,
                             )
@@ -283,3 +290,4 @@ class Pipeline:
                 return r.json()
         except Exception as e:
             return f"Error: {e}"
+    
