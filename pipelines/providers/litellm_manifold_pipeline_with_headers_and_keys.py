@@ -7,6 +7,8 @@ license: MIT
 description: A manifold pipeline that uses LiteLLM.
 """
 
+import ast
+import json
 from pprint import pprint
 from typing import List, Union, Generator, Iterator
 from schemas import OpenAIChatMessage
@@ -279,8 +281,17 @@ class Pipeline:
                         Your daily budget: ${round(float(user_budget), 2)}
                     """
                     return f"Error: {error_message}"
+                elif "bedrock_guardrail_response" in json.dumps(res):
+                    # Get the guardrail response message
+                    try:
+                        error_message = ast.literal_eval(res["error"]["message"])
+                        blocked_response = error_message["bedrock_guardrail_response"]["blockedResponse"]
+                        return blocked_response
+                    except Exception:
+                        return "Guardrail activated!"
+                else:
+                    r.raise_for_status()
 
-                return error_message_full
 
             r.raise_for_status()
 
