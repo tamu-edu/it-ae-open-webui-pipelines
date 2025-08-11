@@ -1,10 +1,11 @@
 """
 title: LiteLLM Manifold Pipeline
 author: open-webui
-date: 2024-05-30
-version: 1.0.1
+author: Blake Dworaczyk <blaked@tamu.edu>
+date: 2025-08-11
+version: 2.0.1
 license: MIT
-description: A manifold pipeline that uses LiteLLM.
+description: A manifold pipeline that uses LiteLLM and tracks spend by implementing per-user virtual keys.
 """
 
 import ast
@@ -64,7 +65,8 @@ class Pipeline:
 
         # Optionally, you can set the name of the manifold pipeline.
         # self.name = "LiteLLM: "
-        self.name = "TAMU: "
+        #self.name = "TAMU: "
+        self.name = ""
 
         # Initialize rate limits
         self.valves = self.Valves(
