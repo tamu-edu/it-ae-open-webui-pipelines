@@ -48,7 +48,9 @@ class Pipeline:
         LITELLM_PIPELINE_DEBUG: bool = False
         LITELLM_USER_BUDGET_NAME: str = ""
         DATABASE_URL: str = ""
-        LITELLM_USER_BUDGET_PERIOD: str = "1d" 
+        LITELLM_USER_BUDGET_PERIOD: str = "1d"
+        LOCAL_DEV: bool = False
+        LITELLM_USER_BUDGET: str = ""
 
     def __init__(self):
         # You can also set the pipelines that are available in this pipeline.
@@ -65,7 +67,7 @@ class Pipeline:
 
         # Optionally, you can set the name of the manifold pipeline.
         # self.name = "LiteLLM: "
-        #self.name = "TAMU: "
+        # self.name = "TAMU: "
         self.name = ""
 
         # Initialize rate limits
@@ -83,6 +85,8 @@ class Pipeline:
                 "LITELLM_USER_BUDGET_PERIOD": os.getenv(
                     "LITELLM_USER_BUDGET_PERIOD", "1d"
                 ),
+                "LOCAL_DEV": os.getenv("LOCAL_DEV", "false") == "true",
+                "LITELLM_USER_BUDGET": os.getenv("LITELLM_USER_BUDGET", ""),
             }
         )
         # Get models on initialization
@@ -162,6 +166,32 @@ class Pipeline:
             if body["user"]["email"] in VIRTUAL_KEY_CACHE:
                 virtual_key = VIRTUAL_KEY_CACHE[body["user"]["email"]]
             else:
+                r_headers = {
+                    "Authorization": f"Bearer {self.valves.LITELLM_API_KEY}",
+                    "Content-Type": "application/json",
+                }
+                if self.valves.LOCAL_DEV:
+                    print("Running in local dev mode, checking for budget")
+                    r = requests.post(
+                        url=f"{self.valves.LITELLM_BASE_URL}/budget/info",
+                        json={"budgets": [self.valves.LITELLM_USER_BUDGET_NAME]},
+                        headers=r_headers
+                    )
+                    r.raise_for_status()
+                    res_json = r.json()
+                    print("Response from LiteLLM budget info:")
+                    pprint(res_json)
+                    if len(res_json) == 0:
+                        r = requests.post(
+                            url=f"{self.valves.LITELLM_BASE_URL}/budget/new",
+                            json={
+                                "budget_id": self.valves.LITELLM_USER_BUDGET_NAME,
+                                "max_budget": self.valves.LITELLM_USER_BUDGET,
+                                "budget_duration": self.valves.LITELLM_USER_BUDGET_PERIOD,
+                            },
+                            headers=r_headers
+                        )
+                        r.raise_for_status()
                 # Ensure the postgresql database exists
                 with psycopg2.connect(self.valves.DATABASE_URL) as conn:
                     with conn.cursor() as cursor:
@@ -182,10 +212,6 @@ class Pipeline:
                         if result:
                             virtual_key = result[1]
                         else:
-                            r_headers = {
-                                "Authorization": f"Bearer {self.valves.LITELLM_API_KEY}",
-                                "Content-Type": "application/json",
-                            }
                             # Create the internal user in LiteLLM
                             r = requests.post(
                                 url=f"{self.valves.LITELLM_BASE_URL}/user/new",
@@ -194,7 +220,7 @@ class Pipeline:
                                     "user_alias": body["user"]["email"],
                                     "user_email": body["user"]["email"],
                                     "user_role": "internal_user_viewer",
-                                    "budget_duration": "1mo"
+                                    "budget_duration": "1mo",
                                 },
                                 headers=r_headers,
                             )
@@ -217,7 +243,7 @@ class Pipeline:
                                     "budget_id": self.valves.LITELLM_USER_BUDGET_NAME,
                                     "key": key_id,
                                     "user_id": res_json["user_id"],
-                                    "budget_duration": self.valves.LITELLM_USER_BUDGET_PERIOD
+                                    "budget_duration": self.valves.LITELLM_USER_BUDGET_PERIOD,
                                 },
                                 headers=r_headers,
                             )
@@ -287,13 +313,14 @@ class Pipeline:
                     # Get the guardrail response message
                     try:
                         error_message = ast.literal_eval(res["error"]["message"])
-                        blocked_response = error_message["bedrock_guardrail_response"]["blockedResponse"]
+                        blocked_response = error_message["bedrock_guardrail_response"][
+                            "blockedResponse"
+                        ]
                         return blocked_response
                     except Exception:
                         return "Guardrail activated!"
                 else:
                     r.raise_for_status()
-
 
             r.raise_for_status()
 
@@ -303,4 +330,3 @@ class Pipeline:
                 return r.json()
         except Exception as e:
             return f"Error: {e}"
-    
