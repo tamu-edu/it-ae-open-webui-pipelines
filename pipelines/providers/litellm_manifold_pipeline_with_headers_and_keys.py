@@ -9,6 +9,9 @@ description: A manifold pipeline that uses LiteLLM and tracks spend by implement
 """
 
 import ast
+from datetime import datetime
+from fastapi import HTTPException
+import httpx
 import json
 from pprint import pprint
 from typing import List, Union, Generator, Iterator
@@ -17,6 +20,7 @@ import psycopg2
 from pydantic import BaseModel
 import re
 import requests
+import time
 import os
 
 import logging
@@ -77,7 +81,10 @@ class Pipeline:
                     "LITELLM_BASE_URL", "http://litellm-service:4000"
                 ),
                 "LITELLM_API_KEY": os.getenv("LITELLM_API_KEY", "your-api-key"),
-                "LITELLM_PIPELINE_DEBUG": os.getenv("LITELLM_PIPELINE_DEBUG", True),
+                "LITELLM_PIPELINE_DEBUG": os.getenv(
+                    "LITELLM_PIPELINE_DEBUG", "False"
+                ).lower()
+                in ["true", "1"],
                 "LITELLM_USER_BUDGET_NAME": os.getenv(
                     "LITELLM_USER_BUDGET_NAME", "Default user budget"
                 ),
@@ -142,15 +149,112 @@ class Pipeline:
             print("LITELLM_BASE_URL not set. Please configure it in the valves.")
             return []
 
+    def _format_budget_error(self, error_message: str) -> str:
+        """Format budget exceeded error messages in a user-friendly way."""
+        if "ExceededBudget" in error_message:
+            user_spend_match = re.search(r"Spend=([\d.]+)", error_message)
+            user_budget_match = re.search(r"Budget=([\d.]+)", error_message)
+
+            if user_spend_match and user_budget_match:
+                user_spend = user_spend_match.group(1)
+                user_budget = user_budget_match.group(1)
+                return f"""You have exceeded your daily budget for AI resources:
+                    • Your current spend: ${round(float(user_spend), 2)}
+                    • Your daily budget: ${round(float(user_budget), 2)}
+                """
+
+        elif "Budget has been exceeded!" in error_message:
+            user_spend_match = re.search(r"Current cost: ([\d.]+)", error_message)
+            user_budget_match = re.search(r"Max budget: ([\d.]+)", error_message)
+
+            if user_spend_match and user_budget_match:
+                user_spend = user_spend_match.group(1)
+                user_budget = user_budget_match.group(1)
+                return f"""You have exceeded your daily budget for AI resources:
+                    • Your current spend: ${round(float(user_spend), 2)}
+                    • Your daily budget: ${round(float(user_budget), 2)}
+                """
+
+        return error_message
+
+    def _format_error_response(
+        self, error_type: str, error_message: str, status_code: int = None
+    ) -> str:
+        """Format error responses for consistent user experience."""
+        formatted_message = (
+            f"🚫 **{error_type.replace('_', ' ').title()}**\n\n{error_message}"
+        )
+
+        if status_code:
+            formatted_message += f"\n\n*Error Code: {status_code}*"
+
+        return formatted_message
+
+    def _handle_litellm_error(self, response) -> str:
+        """Handle various LiteLLM error responses and format them appropriately."""
+        try:
+            res = response.json()
+        except json.JSONDecodeError:
+            return self._format_error_response(
+                "Service Error",
+                f"Received invalid response from AI service (HTTP {response.status_code})",
+                response.status_code,
+            )
+
+        error_info = res.get("error", {})
+        error_message = error_info.get("message", "Unknown error occurred")
+        error_type = error_info.get("type", "Service Error")
+        # error_code = error_info.get("code", None)
+
+        ## Handle specific error types with custom formatting
+        if response.status_code == 400:
+            # Budget exceeded errors
+            if (
+                "ExceededBudget" in error_message
+                or "Budget has been exceeded!" in error_message
+            ):
+                formatted_budget_error = self._format_budget_error(error_message)
+                return self._format_error_response(
+                    "Budget Exceeded", formatted_budget_error, 400
+                )
+
+            # Guardrail responses
+            elif "bedrock_guardrail_response" in json.dumps(res):
+                try:
+                    error_message = ast.literal_eval(res["error"]["message"])
+                    blocked_response = error_message["bedrock_guardrail_response"][
+                        "blockedResponse"
+                    ]
+                    return self._format_error_response(
+                        "Content Filtered", blocked_response, 400
+                    )
+                except Exception:
+                    return self._format_error_response(
+                        "Content Filtered",
+                        "Your request was blocked by content filters.",
+                        400,
+                    )
+
+        return self._format_error_response(
+            error_type, error_message, response.status_code
+        )
+
+    # def stream_error(self, r, error_message):
+    #    if self.valves.LITELLM_PIPELINE_DEBUG:
+    #        print(f"Streaming error with status code {r.status_code}: {error_message}")
+    #    yield error_message
+    #    r.raise_for_status()
+
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Union[str, Generator, Iterator]:
-        # print("Pipelines debug start")
-        # pprint(user_message)
-        # pprint(model_id)
-        # pprint(messages)
-        # pprint(body)
-        # print("Pipelines debug end")
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print("Pipelines debug start")
+            pprint(user_message)
+            pprint(model_id)
+            pprint(messages)
+            pprint(body)
+            print("Pipelines debug end")
 
         if "user" in body:
             print("######################################")
@@ -175,7 +279,7 @@ class Pipeline:
                     r = requests.post(
                         url=f"{self.valves.LITELLM_BASE_URL}/budget/info",
                         json={"budgets": [self.valves.LITELLM_USER_BUDGET_NAME]},
-                        headers=r_headers
+                        headers=r_headers,
                     )
                     r.raise_for_status()
                     res_json = r.json()
@@ -189,7 +293,7 @@ class Pipeline:
                                 "max_budget": self.valves.LITELLM_USER_BUDGET,
                                 "budget_duration": self.valves.LITELLM_USER_BUDGET_PERIOD,
                             },
-                            headers=r_headers
+                            headers=r_headers,
                         )
                         r.raise_for_status()
                 # Ensure the postgresql database exists
@@ -275,58 +379,44 @@ class Pipeline:
                 stream=True,
             )
 
-            if r.status_code == 400:
-                # Handle bad request errors
-                res = r.json()
-                error_message_full = res.get("error", {}).get("message", {})
-                if not error_message_full:
-                    return "Error: Bad request, no error message provided."
-                elif "ExceededBudget" in error_message_full:
-
-                    # Craft a nicer error message for budget exceeded errors
-                    user_spend = re.search(r"Spend=([\d.]+)", error_message_full).group(
-                        1
-                    )
-                    user_budget = re.search(
-                        r"Budget=([\d.]+)", error_message_full
-                    ).group(1)
-
-                    error_message = f"""You have exceeded your daily budget for AI resources:
-                        Your current spend: ${round(float(user_spend), 2)}
-                        Your daily budget: ${round(float(user_budget), 2)}
-                    """
-                    return f"Error: {error_message}"
-                elif "Budget has been exceeded!" in error_message_full:
-                    user_spend = re.search(
-                        r"Current cost: ([\d.]+)", error_message_full
-                    ).group(1)
-                    user_budget = re.search(
-                        r"Max budget: ([\d.]+)", error_message_full
-                    ).group(1)
-                    # Budget has been exceeded! Current cost: 0.020700000000000003, Max budget: 0.01
-                    error_message = f"""You have exceeded your daily budget for AI resources:
-                        Your current spend: ${round(float(user_spend), 2)}
-                        Your daily budget: ${round(float(user_budget), 2)}
-                    """
-                    return f"Error: {error_message}"
-                elif "bedrock_guardrail_response" in json.dumps(res):
-                    # Get the guardrail response message
-                    try:
-                        error_message = ast.literal_eval(res["error"]["message"])
-                        blocked_response = error_message["bedrock_guardrail_response"][
-                            "blockedResponse"
-                        ]
-                        return blocked_response
-                    except Exception:
-                        return "Guardrail activated!"
-                else:
-                    r.raise_for_status()
-
-            r.raise_for_status()
+            # Handle any HTTP error status codes, but only if streaming (in the interface)
+            # We do this because we want scripts to error out, and this prevents that, although
+            # it does provide proper error information
+            if not r.ok and body["stream"]:
+                print("Raising an HTTPException")
+                raise HTTPException(
+                    status_code=r.status_code, detail=self._handle_litellm_error(r)
+                )
 
             if body["stream"]:
                 return r.iter_lines()
             else:
                 return r.json()
+
+        except requests.exceptions.ConnectionError as e:
+            return self._format_error_response(
+                "Connection Error",
+                "Unable to connect to the AI service. Please check your network connection and try again.",
+            )
+        except requests.exceptions.Timeout as e:
+            return self._format_error_response(
+                "Timeout Error",
+                "The AI service is taking too long to respond. Please try again.",
+            )
+        except requests.exceptions.RequestException as e:
+            return self._format_error_response(
+                "Network Error",
+                f"A network error occurred while communicating with the AI service: {str(e)}",
+            )
+        except psycopg2.Error as e:
+            print(f"Database error: {e}")
+            return self._format_error_response(
+                "System Error",
+                "A system error occurred. Please contact your administrator.",
+            )
         except Exception as e:
-            return f"Error: {e}"
+            print(f"Unexpected error: {e}")
+            return self._format_error_response(
+                "Unexpected Error",
+                f"An unexpected error occurred: {str(e)}",
+            )
