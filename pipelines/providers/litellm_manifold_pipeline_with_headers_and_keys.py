@@ -5,11 +5,12 @@ author: Blake Dworaczyk <blaked@tamu.edu>
 date: 2025-08-11
 version: 2.0.1
 license: MIT
-description: A manifold pipeline that uses LiteLLM and tracks spend by implementing per-user virtual keys.
+description: A manifold pipeline that uses LiteLLM and tracks spend by implementing per-user virtual keys and team-based virtual keys.
 """
 
 import ast
 from datetime import datetime
+from enum import member
 from fastapi import HTTPException
 import httpx
 import json
@@ -42,6 +43,9 @@ if os.environ.get("LITELLM_PIPELINE_DEBUG", "False").lower() in ["true", "1"]:
     HTTPConnection.debuglevel = 1
 
 VIRTUAL_KEY_CACHE = {}
+TEAM_VIRTUAL_KEY_GROUP_CACHE = {}
+TEAM_USER_GROUP_CACHE = {}
+TEAM_LAST_UPDATED = {}
 
 
 class Pipeline:
@@ -55,6 +59,9 @@ class Pipeline:
         LITELLM_USER_BUDGET_PERIOD: str = "1d"
         LOCAL_DEV: bool = False
         LITELLM_USER_BUDGET: str = ""
+        BILLING_TEAMS_ENABLED: bool = False
+        OPENWEBUI_API_KEY: str = ""
+        OPENWEBUI_BASE_URL: str = ""
 
     def __init__(self):
         # You can also set the pipelines that are available in this pipeline.
@@ -94,6 +101,10 @@ class Pipeline:
                 ),
                 "LOCAL_DEV": os.getenv("LOCAL_DEV", "false") == "true",
                 "LITELLM_USER_BUDGET": os.getenv("LITELLM_USER_BUDGET", ""),
+                "BILLING_TEAMS_ENABLED": os.getenv("BILLING_TEAMS_ENABLED", "false")
+                == "true",
+                "OPENWEBUI_API_KEY": os.getenv("OPENWEBUI_API_KEY", ""),
+                "OPENWEBUI_BASE_URL": os.getenv("OPENWEBUI_BASE_URL", "")
             }
         )
         # Get models on initialization
@@ -239,11 +250,153 @@ class Pipeline:
             error_type, error_message, response.status_code
         )
 
-    # def stream_error(self, r, error_message):
-    #    if self.valves.LITELLM_PIPELINE_DEBUG:
-    #        print(f"Streaming error with status code {r.status_code}: {error_message}")
-    #    yield error_message
-    #    r.raise_for_status()
+    def get_user_billing_groups(self, user_email: str, headers: dict) -> List[str]:
+        """Fetch user groups from OpenWebUI."""
+        try:
+            r = requests.get(
+                url=f"{self.valves.OPENWEBUI_BASE_URL}/api/v1/users/all",
+                headers=headers,
+            )
+            r.raise_for_status()
+            res_json = r.json()
+            if self.valves.LITELLM_PIPELINE_DEBUG:
+                print("Response from OpenWebUI users:")
+                pprint(res_json)
+            user_id = [
+                user["id"] for user in res_json["users"] if user["email"] == user_email
+            ][0]
+            r = requests.get(
+                url=f"{self.valves.OPENWEBUI_BASE_URL}/api/v1/users/{user_id}/groups",
+                headers=headers,
+            )
+            r.raise_for_status()
+            res_json = r.json()
+            if self.valves.LITELLM_PIPELINE_DEBUG:
+                print("Response from OpenWebUI user groups:")
+                pprint(res_json)
+            user_billing_groups = [
+                group["name"] for group in res_json if "-billing-" in group["name"]
+            ]
+            # Check against the DB of billing groups
+            #### TODO #####
+            return user_billing_groups
+
+        except requests.exceptions.RequestException as e:
+            print(f"Error fetching user billing groups: {e}")
+            return []
+
+    def get_user_key_and_create_if_missing(
+        self, user_email: str, r_headers: dict, cursor
+    ) -> str:
+        cursor.execute(
+            "SELECT username, virtualKey FROM litellm_user_keys WHERE username = %s;",
+            (user_email,),
+        )
+        result = cursor.fetchone()
+        if result:
+            virtual_key = result[1]
+        else:
+            # Create the internal user in LiteLLM
+            r = requests.post(
+                url=f"{self.valves.LITELLM_BASE_URL}/user/new",
+                json={
+                    "key_alias": "pipelines_generated_key",
+                    "user_alias": user_email,
+                    "user_email": user_email,
+                    "user_role": "internal_user_viewer",
+                    "budget_duration": "1mo",
+                },
+                headers=r_headers,
+            )
+            r.raise_for_status()
+            res_json = r.json()
+            print("Response from LiteLLM user creation:")
+            pprint(res_json)
+
+            # Get the user's virtual key id
+            r = requests.get(
+                url=f"{self.valves.LITELLM_BASE_URL}/key/list?page=1&size=10&user_id={res_json['user_id']}&return_full_object=false&include_team_keys=false&sort_order=desc",
+                headers=r_headers,
+            )
+            r.raise_for_status()
+            key_id = r.json()["keys"][0]
+            # Assign a budget to the user's key
+            r = requests.post(
+                url=f"{self.valves.LITELLM_BASE_URL}/key/update",
+                json={
+                    "budget_id": self.valves.LITELLM_USER_BUDGET_NAME,
+                    "key": key_id,
+                    "user_id": res_json["user_id"],
+                    "budget_duration": self.valves.LITELLM_USER_BUDGET_PERIOD,
+                },
+                headers=r_headers,
+            )
+            r.raise_for_status()
+            virtual_key = res_json["key"]
+            cursor.execute(
+                "INSERT INTO litellm_user_keys (username, virtualKey) VALUES (%s, %s) ON CONFLICT (username) DO UPDATE SET virtualKey = EXCLUDED.virtualKey;",
+                (user_email, virtual_key),
+            )
+
+    def get_team_key_and_create_if_missing(
+        self, team_name: str, r_headers: dict, cursor
+    ) -> str:
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS litellm_team_keys (
+                team_name VARCHAR(100) NOT NULL,
+                virtualKey TEXT NOT NULL,
+                update_team BOOLEAN DEFAULT FALSE,
+            CONSTRAINT pk_litellm_team_keys PRIMARY KEY (team_name)
+            );
+            """
+        )
+
+        cursor.execute(
+            "SELECT team_name, virtualKey FROM litellm_team_keys WHERE team_name = %s;",
+            (team_name,),
+        )
+        result = cursor.fetchone()
+        if result:
+            virtual_key = result[1]
+            return virtual_key
+
+        # Get the Team's ID
+        r = requests.get(
+            url=f"{self.valves.LITELLM_BASE_URL}/team/list",
+            headers=r_headers,
+        )
+        r.raise_for_status()
+        res_json = r.json()
+        print("Response from LiteLLM team list:")
+        pprint(res_json)
+        team_data = [t for t in res_json if t["team_alias"] == team_name]
+        if len(team_data) == 0:
+            raise Exception(f"Team {team_name} does not exist in LiteLLM")
+        else:
+            team_id = team_data[0]["team_id"]
+
+        # Create a new key for the team
+        r = requests.post(
+            url=f"{self.valves.LITELLM_BASE_URL}/key/generate",
+            json={
+                "key_alias": team_name,
+                "team_id": team_id,
+            },
+            headers=r_headers,
+        )
+        r.raise_for_status()
+        res = r.json()
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print("Response from LiteLLM team key generation:")
+            pprint(res)
+        virtual_key = res["key"]
+        cursor.execute(
+            "INSERT INTO litellm_team_keys (team_name, virtualKey) VALUES (%s, %s) ON CONFLICT (team_name) DO UPDATE SET virtualKey = EXCLUDED.virtualKey;",
+            (team_name, virtual_key),
+        )
+
+        return virtual_key
 
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
@@ -266,14 +419,67 @@ class Pipeline:
         # if self.valves.LITELLM_API_KEY:
         #    headers["Authorization"] = f"Bearer {self.valves.LITELLM_API_KEY}"
 
+        r_headers = {
+            "Authorization": f"Bearer {self.valves.LITELLM_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
         try:
-            if body["user"]["email"] in VIRTUAL_KEY_CACHE:
+            # If teams are enabled and the user is a member of a team, ensure that they have been added
+            if self.valves.BILLING_TEAMS_ENABLED:
+                if self.valves.LITELLM_PIPELINE_DEBUG:
+                    print("Billing teams are enabled, checking for user groups")
+                group = None
+                last_updated_time = TEAM_LAST_UPDATED.get(body["user"]["email"], 0)
+                expired_cache = (time.time() - last_updated_time) > 1800
+                if self.valves.LITELLM_PIPELINE_DEBUG:
+                    print(f"Cache expiration for user {body['user']['email']}: {expired_cache}")
+
+                if body["user"]["email"] in TEAM_USER_GROUP_CACHE:
+                    if self.valves.LITELLM_PIPELINE_DEBUG:
+                        print(f"User {body['user']['email']} found in team user group cache... Checking if refresh is needed")
+                    if body["user"]["email"] in TEAM_LAST_UPDATED and not expired_cache:
+                        if self.valves.LITELLM_PIPELINE_DEBUG:
+                            print(f"User {body['user']['email']} team user group cache is fresh, using cached group")
+                        group = TEAM_USER_GROUP_CACHE[body["user"]["email"]]
+
+                if group is None:
+                    if self.valves.LITELLM_PIPELINE_DEBUG:
+                        print(f"User {body['user']['email']} not found in team user group cache or cache is expired, fetching from OpenWebUI")
+                    openwebui_r_headers = {
+                        "Authorization": f"Bearer {self.valves.OPENWEBUI_API_KEY}",
+                        "Content-Type": "application/json",
+                    }
+                    groups = self.get_user_billing_groups(
+                        body["user"]["email"], openwebui_r_headers
+                    )
+                    if len(groups) == 0:
+                        return self._format_error_response(
+                            "No Billing Group",
+                            "You are not a member of any billing groups. Please contact your administrator.",
+                        )
+                    elif self.valves.LITELLM_PIPELINE_DEBUG:
+                        print(
+                            f"User {body['user']['email']} is in billing groups: {groups}"
+                        )
+                    group = groups[0]
+                    TEAM_USER_GROUP_CACHE[body["user"]["email"]] = group
+                    TEAM_LAST_UPDATED[body["user"]["email"]] = time.time()
+
+                print(f"User {body['user']['email']} is in billing group {group}")
+                if group in TEAM_VIRTUAL_KEY_GROUP_CACHE:
+                    virtual_key = TEAM_VIRTUAL_KEY_GROUP_CACHE[group]
+                else:
+                    with psycopg2.connect(self.valves.DATABASE_URL) as conn:
+                        with conn.cursor() as cursor:
+                            virtual_key = self.get_team_key_and_create_if_missing(
+                                group, r_headers, cursor
+                            )
+                            TEAM_VIRTUAL_KEY_GROUP_CACHE[group] = virtual_key
+
+            elif body["user"]["email"] in VIRTUAL_KEY_CACHE:
                 virtual_key = VIRTUAL_KEY_CACHE[body["user"]["email"]]
             else:
-                r_headers = {
-                    "Authorization": f"Bearer {self.valves.LITELLM_API_KEY}",
-                    "Content-Type": "application/json",
-                }
                 if self.valves.LOCAL_DEV:
                     print("Running in local dev mode, checking for budget")
                     r = requests.post(
@@ -296,7 +502,7 @@ class Pipeline:
                             headers=r_headers,
                         )
                         r.raise_for_status()
-                # Ensure the postgresql database exists
+                # Ensure the postgresql table exists
                 with psycopg2.connect(self.valves.DATABASE_URL) as conn:
                     with conn.cursor() as cursor:
                         create_table_query = """
@@ -308,55 +514,10 @@ class Pipeline:
                         );
                         """
                         cursor.execute(create_table_query)
-                        cursor.execute(
-                            "SELECT username, virtualKey FROM litellm_user_keys WHERE username = %s;",
-                            (body["user"]["email"],),
+                        virtual_key = self.get_user_key_and_create_if_missing(
+                            body["user"]["email"], r_headers, cursor
                         )
-                        result = cursor.fetchone()
-                        if result:
-                            virtual_key = result[1]
-                        else:
-                            # Create the internal user in LiteLLM
-                            r = requests.post(
-                                url=f"{self.valves.LITELLM_BASE_URL}/user/new",
-                                json={
-                                    "key_alias": "pipelines_generated_key",
-                                    "user_alias": body["user"]["email"],
-                                    "user_email": body["user"]["email"],
-                                    "user_role": "internal_user_viewer",
-                                    "budget_duration": "1mo",
-                                },
-                                headers=r_headers,
-                            )
-                            r.raise_for_status()
-                            res_json = r.json()
-                            print("Response from LiteLLM user creation:")
-                            pprint(res_json)
 
-                            # Get the user's virtual key id
-                            r = requests.get(
-                                url=f"{self.valves.LITELLM_BASE_URL}/key/list?page=1&size=10&user_id={res_json['user_id']}&return_full_object=false&include_team_keys=false&sort_order=desc",
-                                headers=r_headers,
-                            )
-                            r.raise_for_status()
-                            key_id = r.json()["keys"][0]
-                            # Assign a budget to the user's key
-                            r = requests.post(
-                                url=f"{self.valves.LITELLM_BASE_URL}/key/update",
-                                json={
-                                    "budget_id": self.valves.LITELLM_USER_BUDGET_NAME,
-                                    "key": key_id,
-                                    "user_id": res_json["user_id"],
-                                    "budget_duration": self.valves.LITELLM_USER_BUDGET_PERIOD,
-                                },
-                                headers=r_headers,
-                            )
-                            r.raise_for_status()
-                            virtual_key = res_json["key"]
-                            cursor.execute(
-                                "INSERT INTO litellm_user_keys (username, virtualKey) VALUES (%s, %s) ON CONFLICT (username) DO UPDATE SET virtualKey = EXCLUDED.virtualKey;",
-                                (body["user"]["email"], virtual_key),
-                            )
                 VIRTUAL_KEY_CACHE[body["user"]["email"]] = virtual_key
 
             headers["Authorization"] = f"Bearer {virtual_key}"
