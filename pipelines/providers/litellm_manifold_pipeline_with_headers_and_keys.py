@@ -288,6 +288,8 @@ class Pipeline:
     def get_user_key_and_create_if_missing(
         self, user_email: str, r_headers: dict, cursor
     ) -> str:
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print(f"Checking for existing virtual key for user {user_email} in database")
         cursor.execute(
             "SELECT username, virtualKey FROM litellm_user_keys WHERE username = %s;",
             (user_email,),
@@ -295,12 +297,14 @@ class Pipeline:
         result = cursor.fetchone()
         if result:
             virtual_key = result[1]
+            if self.valves.LITELLM_PIPELINE_DEBUG:
+                print(f"Found existing virtual key for user {user_email} in database: {virtual_key}")
         else:
             # Create the internal user in LiteLLM
             r = requests.post(
                 url=f"{self.valves.LITELLM_BASE_URL}/user/new",
                 json={
-                    "key_alias": "pipelines_generated_key",
+                    "key_alias": user_email,
                     "user_alias": user_email,
                     "user_email": user_email,
                     "user_role": "internal_user_viewer",
@@ -337,6 +341,8 @@ class Pipeline:
                 "INSERT INTO litellm_user_keys (username, virtualKey) VALUES (%s, %s) ON CONFLICT (username) DO UPDATE SET virtualKey = EXCLUDED.virtualKey;",
                 (user_email, virtual_key),
             )
+
+        return virtual_key
 
     def get_team_key_and_create_if_missing(
         self, team_name: str, r_headers: dict, cursor
@@ -517,6 +523,8 @@ class Pipeline:
                         virtual_key = self.get_user_key_and_create_if_missing(
                             body["user"]["email"], r_headers, cursor
                         )
+                        if self.valves.LITELLM_PIPELINE_DEBUG:
+                            print(f"Storing virtual key for user {body['user']['email']} in cache: {virtual_key}")
 
                 VIRTUAL_KEY_CACHE[body["user"]["email"]] = virtual_key
 
