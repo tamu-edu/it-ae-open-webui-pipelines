@@ -469,7 +469,7 @@ class Pipeline:
                             f"User {user_email} not found in team user group cache or cache is expired or unverified, fetching from OpenWebUI"
                         )
                     billing_groups = self.get_user_billing_groups(
-                        user_email, openwebui_r_headers
+                        user_email, headers
                     )
                     if len(billing_groups) == 0:
                         return self._format_error_response(
