@@ -46,6 +46,7 @@ VIRTUAL_KEY_CACHE = {}
 TEAM_VIRTUAL_KEY_GROUP_CACHE = {}
 TEAM_USER_GROUP_CACHE = {}
 TEAM_LAST_UPDATED = {}
+USER_LAST_CHAT_DATE = {}
 
 
 class Pipeline:
@@ -62,6 +63,7 @@ class Pipeline:
         BILLING_TEAMS_ENABLED: bool = False
         OPENWEBUI_API_KEY: str = ""
         OPENWEBUI_BASE_URL: str = ""
+        LAST_CHAT_DATE_REQUIRED_DAYS: int = 30
 
     def __init__(self):
         # You can also set the pipelines that are available in this pipeline.
@@ -104,7 +106,10 @@ class Pipeline:
                 "BILLING_TEAMS_ENABLED": os.getenv("BILLING_TEAMS_ENABLED", "false")
                 == "true",
                 "OPENWEBUI_API_KEY": os.getenv("OPENWEBUI_API_KEY", ""),
-                "OPENWEBUI_BASE_URL": os.getenv("OPENWEBUI_BASE_URL", "")
+                "OPENWEBUI_BASE_URL": os.getenv("OPENWEBUI_BASE_URL", ""),
+                "LAST_CHAT_DATE_REQUIRED_DAYS": int(
+                    os.getenv("LAST_CHAT_DATE_REQUIRED_DAYS", 30)
+                ),
             }
         )
         # Get models on initialization
@@ -289,7 +294,9 @@ class Pipeline:
         self, user_email: str, r_headers: dict, cursor
     ) -> str:
         if self.valves.LITELLM_PIPELINE_DEBUG:
-            print(f"Checking for existing virtual key for user {user_email} in database")
+            print(
+                f"Checking for existing virtual key for user {user_email} in database"
+            )
         cursor.execute(
             "SELECT username, virtualKey FROM litellm_user_keys WHERE username = %s;",
             (user_email,),
@@ -298,7 +305,9 @@ class Pipeline:
         if result:
             virtual_key = result[1]
             if self.valves.LITELLM_PIPELINE_DEBUG:
-                print(f"Found existing virtual key for user {user_email} in database: {virtual_key}")
+                print(
+                    f"Found existing virtual key for user {user_email} in database: {virtual_key}"
+                )
         else:
             # Create the internal user in LiteLLM
             r = requests.post(
@@ -365,7 +374,16 @@ class Pipeline:
         result = cursor.fetchone()
         if result:
             virtual_key = result[1]
+            if self.valves.LITELLM_PIPELINE_DEBUG:
+                print(
+                    f"Found virtual key for team {team_name} in database: {virtual_key}"
+                )
             return virtual_key
+
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print(
+                f"Fetching virtual key for team {team_name} from LiteLLM (should have been precreated separately)"
+            )
 
         # Get the Team's ID
         r = requests.get(
@@ -404,6 +422,129 @@ class Pipeline:
 
         return virtual_key
 
+    # Figure out a user's billing group, either from cache or DB, or fetch from OpenWebUI and store in DB
+    # If a billing group is provided, use that one if the user is a member of it
+    def fetch_and_update_user_billing_group(
+        self, user_email: str, headers, existing_billing_group: str = None
+    ) -> Union[str, None]:
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print(
+                f"User {user_email} not found in team user group cache or cache is expired or unverified, checking database"
+            )
+
+        billing_group_verified = existing_billing_group is None
+
+        with psycopg2.connect(self.valves.DATABASE_URL) as conn:
+            with conn.cursor() as cursor:
+                create_table_query = """
+                    CREATE TABLE IF NOT EXISTS litellm_user_last_used_billing_group (
+                        username VARCHAR(50) NOT NULL,
+                        billing_group TEXT NOT NULL,
+                        update_user BOOLEAN DEFAULT FALSE,
+                        created BIGINT NOT NULL,
+                        updated BIGINT NOT NULL,
+                        CONSTRAINT pk_litellm_user_last_used_billing_group PRIMARY KEY (username)
+                    );
+                """
+                cursor.execute(create_table_query)
+
+                cursor.execute(
+                    "SELECT username, billing_group FROM litellm_user_last_used_billing_group WHERE username = %s;",
+                    (user_email,),
+                )
+                result = cursor.fetchone()
+                if (
+                    result
+                    and not billing_group_verified
+                    and result[1] == existing_billing_group
+                ):
+                    billing_group = existing_billing_group
+                    billing_group_verified = True
+                elif result:
+                    billing_group = result[1]
+
+                if not result or not billing_group_verified:
+                    if self.valves.LITELLM_PIPELINE_DEBUG:
+                        print(
+                            f"User {user_email} not found in team user group cache or cache is expired or unverified, fetching from OpenWebUI"
+                        )
+                    billing_groups = self.get_user_billing_groups(
+                        user_email, openwebui_r_headers
+                    )
+                    if len(billing_groups) == 0:
+                        return self._format_error_response(
+                            "No Billing Group",
+                            "You are not a member of any billing groups. Please contact your administrator.",
+                        )
+                    elif self.valves.LITELLM_PIPELINE_DEBUG:
+                        print(
+                            f"User {user_email} is in billing groups: {billing_groups}"
+                        )
+                    if (
+                        existing_billing_group
+                        and existing_billing_group in billing_groups
+                    ):
+                        billing_group = existing_billing_group
+                    else:
+                        billing_group = billing_groups[0]
+
+                    cursor.execute(
+                        "INSERT INTO litellm_user_last_used_billing_group (username, billing_group, created, updated) VALUES (%s, %s, %s, %s) ON CONFLICT (username) DO UPDATE SET billing_group = EXCLUDED.billing_group, updated = EXCLUDED.updated;",
+                        (user_email, billing_group, int(time.time()), int(time.time())),
+                    )
+
+                TEAM_USER_GROUP_CACHE[user_email] = billing_group
+                TEAM_LAST_UPDATED[user_email] = time.time()
+
+                return billing_group
+
+    def get_user_last_chat_date(self, user_id: str, headers: dict) -> Union[int, None]:
+        r = requests.get(
+            url=f"{self.valves.OPENWEBUI_BASE_URL}/api/v1/chats/list/user/{user_id}",
+            headers=headers,
+        )
+        r.raise_for_status()
+        res_json = r.json()
+
+        if not res_json:
+            last_chat_date = None
+        else:
+            last_chat_date = res_json[0]["updated_at"]
+
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print(f"User {user_id} last chat date: {last_chat_date}")
+
+        return last_chat_date
+
+    # Determine if the last time that a user had an interactive chat was recent enough
+    # This is because we need them to occasionally log in to update their groups and ensure
+    # that they are still authorized to use their API keys directly
+    def last_chat_date_is_recent(self, user_id: str, headers: dict) -> bool:
+        last_chat_date = None
+        if USER_LAST_CHAT_DATE.get(user_id, None) is not None:
+            last_chat_date = USER_LAST_CHAT_DATE[user_id]
+
+        if (
+            last_chat_date is None
+            or last_chat_date
+            < time.time() - self.valves.LAST_CHAT_DATE_REQUIRED_DAYS * 86400
+        ):
+            last_chat_date = self.get_user_last_chat_date(user_id, headers)
+            USER_LAST_CHAT_DATE[user_id] = last_chat_date
+
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print(
+                f"User {user_id} last chat date (cached or fetched): {last_chat_date}"
+            )
+
+        if (
+            last_chat_date
+            > time.time() - self.valves.LAST_CHAT_DATE_REQUIRED_DAYS * 86400
+        ):
+            return True
+
+        return False
+
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Union[str, Generator, Iterator]:
@@ -430,58 +571,122 @@ class Pipeline:
             "Content-Type": "application/json",
         }
 
+        openwebui_r_headers = {
+            "Authorization": f"Bearer {self.valves.OPENWEBUI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+
+        # We need the user to log into the web console periodically to ensure that they still have access.
+        # This is necessary to ensure that groups are updated and API keys don't work forever if a user loses access.
+        last_chat_date_is_recent = self.last_chat_date_is_recent(
+            body["user"]["id"], openwebui_r_headers
+        )
+        if not last_chat_date_is_recent:
+            return self._format_error_response(
+                "Web Login Required",
+                f"Please log into the web console and create a chat at least once every {self.valves.LAST_CHAT_DATE_REQUIRED_DAYS} days to continue using your API key.",
+            )
+
         try:
             # If teams are enabled and the user is a member of a team, ensure that they have been added
             if self.valves.BILLING_TEAMS_ENABLED:
                 if self.valves.LITELLM_PIPELINE_DEBUG:
                     print("Billing teams are enabled, checking for user groups")
-                group = None
-                last_updated_time = TEAM_LAST_UPDATED.get(body["user"]["email"], 0)
-                expired_cache = (time.time() - last_updated_time) > 1800
-                if self.valves.LITELLM_PIPELINE_DEBUG:
-                    print(f"Cache expiration for user {body['user']['email']}: {expired_cache}")
 
-                if body["user"]["email"] in TEAM_USER_GROUP_CACHE:
+                tools = body.get("tools", [])
+                billing_group_check = [
+                    t
+                    for t in tools
+                    if t.get("type") == "custom"
+                    and t.get("name").startswith("billing_group[")
+                ]
+                billing_group = (
+                    None
+                    if len(billing_group_check) == 0
+                    else billing_group_check[0]["name"]
+                    .replace("billing_group[", "")
+                    .replace("]", "")
+                )
+
+                if billing_group:
                     if self.valves.LITELLM_PIPELINE_DEBUG:
-                        print(f"User {body['user']['email']} found in team user group cache... Checking if refresh is needed")
-                    if body["user"]["email"] in TEAM_LAST_UPDATED and not expired_cache:
+                        print(f"User passed billing group: {billing_group}")
+
+                    if (
+                        body["user"]["email"] in TEAM_USER_GROUP_CACHE
+                        and TEAM_USER_GROUP_CACHE[body["user"]["email"]]
+                        != billing_group
+                    ):
                         if self.valves.LITELLM_PIPELINE_DEBUG:
-                            print(f"User {body['user']['email']} team user group cache is fresh, using cached group")
-                        group = TEAM_USER_GROUP_CACHE[body["user"]["email"]]
+                            print(
+                                f"User {body['user']['email']} cached billing group {TEAM_USER_GROUP_CACHE[body['user']['email']]} does not match provided group {billing_group}, updating cache"
+                            )
+                        billing_group = self.fetch_and_update_user_billing_group(
+                            body["user"]["email"], openwebui_r_headers, billing_group
+                        )
+                    else:
+                        if self.valves.LITELLM_PIPELINE_DEBUG:
+                            print(
+                                f"User {body['user']['email']} cached billing group is valid, using cached group"
+                            )
 
-                if group is None:
                     if self.valves.LITELLM_PIPELINE_DEBUG:
-                        print(f"User {body['user']['email']} not found in team user group cache or cache is expired, fetching from OpenWebUI")
-                    openwebui_r_headers = {
-                        "Authorization": f"Bearer {self.valves.OPENWEBUI_API_KEY}",
-                        "Content-Type": "application/json",
-                    }
-                    groups = self.get_user_billing_groups(
-                        body["user"]["email"], openwebui_r_headers
-                    )
-                    if len(groups) == 0:
-                        return self._format_error_response(
-                            "No Billing Group",
-                            "You are not a member of any billing groups. Please contact your administrator.",
-                        )
-                    elif self.valves.LITELLM_PIPELINE_DEBUG:
-                        print(
-                            f"User {body['user']['email']} is in billing groups: {groups}"
-                        )
-                    group = groups[0]
-                    TEAM_USER_GROUP_CACHE[body["user"]["email"]] = group
-                    TEAM_LAST_UPDATED[body["user"]["email"]] = time.time()
+                        print(f"Using billing group: {billing_group}")
 
-                print(f"User {body['user']['email']} is in billing group {group}")
-                if group in TEAM_VIRTUAL_KEY_GROUP_CACHE:
-                    virtual_key = TEAM_VIRTUAL_KEY_GROUP_CACHE[group]
+                    TEAM_USER_GROUP_CACHE[body["user"]["email"]] = billing_group
+                    TEAM_LAST_UPDATED[body["user"]["email"]] = time.time()
                 else:
+                    if self.valves.LITELLM_PIPELINE_DEBUG:
+                        print("No billing group specified in metadata")
+
+                    last_updated_time = TEAM_LAST_UPDATED.get(body["user"]["email"], 0)
+                    expired_cache = (time.time() - last_updated_time) > 1800
+                    if self.valves.LITELLM_PIPELINE_DEBUG:
+                        print(
+                            f"Cache expiration for user {body['user']['email']}: {expired_cache}"
+                        )
+
+                    if body["user"]["email"] in TEAM_USER_GROUP_CACHE:
+                        if self.valves.LITELLM_PIPELINE_DEBUG:
+                            print(
+                                f"User {body['user']['email']} found in team user group cache... Checking if refresh is needed"
+                            )
+                        if (
+                            body["user"]["email"] in TEAM_LAST_UPDATED
+                            and not expired_cache
+                        ):
+                            if self.valves.LITELLM_PIPELINE_DEBUG:
+                                print(
+                                    f"User {body['user']['email']} team user group cache is fresh, using cached group"
+                                )
+                            billing_group = TEAM_USER_GROUP_CACHE[body["user"]["email"]]
+
+                    if billing_group is None:
+                        billing_group = self.fetch_and_update_user_billing_group(
+                            body["user"]["email"], openwebui_r_headers
+                        )
+                    print(
+                        f"User {body['user']['email']} is in billing group {billing_group}"
+                    )
+                if billing_group in TEAM_VIRTUAL_KEY_GROUP_CACHE:
+                    virtual_key = TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group]
+                    if self.valves.LITELLM_PIPELINE_DEBUG:
+                        print(
+                            f"Using cached virtual key for team {billing_group}: {virtual_key}"
+                        )
+                else:
+                    print(
+                        f"Fetching virtual key for team {billing_group} from database or creating if missing"
+                    )
                     with psycopg2.connect(self.valves.DATABASE_URL) as conn:
                         with conn.cursor() as cursor:
                             virtual_key = self.get_team_key_and_create_if_missing(
-                                group, r_headers, cursor
+                                billing_group, r_headers, cursor
                             )
-                            TEAM_VIRTUAL_KEY_GROUP_CACHE[group] = virtual_key
+                            TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group] = virtual_key
+
+                if self.valves.LITELLM_PIPELINE_DEBUG:
+                    print(f"Final billing group used: {billing_group}")
 
             elif body["user"]["email"] in VIRTUAL_KEY_CACHE:
                 virtual_key = VIRTUAL_KEY_CACHE[body["user"]["email"]]
@@ -524,7 +729,9 @@ class Pipeline:
                             body["user"]["email"], r_headers, cursor
                         )
                         if self.valves.LITELLM_PIPELINE_DEBUG:
-                            print(f"Storing virtual key for user {body['user']['email']} in cache: {virtual_key}")
+                            print(
+                                f"Storing virtual key for user {body['user']['email']} in cache: {virtual_key}"
+                            )
 
                 VIRTUAL_KEY_CACHE[body["user"]["email"]] = virtual_key
 
@@ -535,6 +742,18 @@ class Pipeline:
             payload.pop("chat_id", None)
             # payload.pop("user", None)
             payload.pop("title", None)
+
+            if "tools" in payload:
+                non_billing_tools = [
+                    t
+                    for t in payload["tools"]
+                    if t.get("type") != "custom"
+                    or not t.get("name").startswith("billing_group[")
+                ]
+                if len(non_billing_tools) > 0:
+                    payload["tools"] = non_billing_tools
+                else:
+                    payload.pop("tools", None)
 
             print("Payload for LiteLLM:")
             pprint(payload)
