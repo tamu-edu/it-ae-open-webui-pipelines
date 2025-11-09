@@ -191,6 +191,9 @@ class Pipeline:
     def _format_error_response(
         self, error_type: str, error_message: str, status_code: int = None
     ) -> str:
+        if error_type is None:
+            error_type = "Error"
+        
         """Format error responses for consistent user experience."""
         formatted_message = (
             f"🚫 **{error_type.replace('_', ' ').title()}**\n\n{error_message}"
