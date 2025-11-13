@@ -46,6 +46,7 @@ VIRTUAL_KEY_CACHE = {}
 TEAM_VIRTUAL_KEY_GROUP_CACHE = {}
 TEAM_USER_GROUP_CACHE = {}
 TEAM_LAST_UPDATED = {}
+USER_KEY_CACHE_TIMEOUT = 1800  # 30 minutes
 
 
 class Pipeline:
@@ -438,6 +439,20 @@ class Pipeline:
         )
 
         return virtual_key
+    
+    def user_key_cache_chat_insert(self, user_email: str, virtual_key: str):
+        VIRTUAL_KEY_CACHE[user_email] = (virtual_key, time.time())
+
+    def user_key_cache_get(self, user_email: str) -> Union[str, None]:
+        if user_email in VIRTUAL_KEY_CACHE:
+            cached_key, timestamp = VIRTUAL_KEY_CACHE[user_email]
+            # Check if the cache is still valid (30 minutes)
+            if (time.time() - timestamp) < USER_KEY_CACHE_TIMEOUT:
+                return cached_key
+            else:
+                # Cache expired
+                del VIRTUAL_KEY_CACHE[user_email]
+        return None
 
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
@@ -516,8 +531,8 @@ class Pipeline:
                             )
                             TEAM_VIRTUAL_KEY_GROUP_CACHE[group] = virtual_key
 
-            elif body["user"]["email"] in VIRTUAL_KEY_CACHE:
-                virtual_key = VIRTUAL_KEY_CACHE[body["user"]["email"]]
+            elif self.user_key_cache_get(body["user"]["email"]) is not None:
+                virtual_key = self.user_key_cache_get(body["user"]["email"])
                 if self.valves.LITELLM_PIPELINE_DEBUG:
                     print(f"Using cached virtual key for user {body['user']['email']}: {virtual_key}")
             else:
@@ -561,7 +576,7 @@ class Pipeline:
                         if self.valves.LITELLM_PIPELINE_DEBUG:
                             print(f"Storing virtual key for user {body['user']['email']} in cache: {virtual_key}")
 
-                VIRTUAL_KEY_CACHE[body["user"]["email"]] = virtual_key
+                self.user_key_cache_chat_insert(body["user"]["email"], virtual_key)
 
             headers["Authorization"] = f"Bearer {virtual_key}"
 
