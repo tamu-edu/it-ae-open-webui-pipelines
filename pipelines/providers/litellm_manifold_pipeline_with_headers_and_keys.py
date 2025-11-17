@@ -47,6 +47,7 @@ TEAM_VIRTUAL_KEY_GROUP_CACHE = {}
 TEAM_USER_GROUP_CACHE = {}
 TEAM_LAST_UPDATED = {}
 USER_LAST_CHAT_DATE = {}
+USER_KEY_CACHE_TIMEOUT = 1800  # 30 minutes
 
 
 class Pipeline:
@@ -196,6 +197,9 @@ class Pipeline:
     def _format_error_response(
         self, error_type: str, error_message: str, status_code: int = None
     ) -> str:
+        if error_type is None:
+            error_type = "Error"
+        
         """Format error responses for consistent user experience."""
         formatted_message = (
             f"🚫 **{error_type.replace('_', ' ').title()}**\n\n{error_message}"
@@ -309,7 +313,34 @@ class Pipeline:
                     f"Found existing virtual key for user {user_email} in database: {virtual_key}"
                 )
         else:
-            # Create the internal user in LiteLLM
+            # Determine if the user already exists in LiteLLM. They might if this process failed halfway through before.
+            # That would mean that the user was created, but the key was not assigned or stored.
+            r = requests.get(
+                url=f"{self.valves.LITELLM_BASE_URL}/user/list?user_email={user_email}&page=1&page_size=25&sort_order=asc",
+                headers=r_headers,
+            )
+            r.raise_for_status()
+            res_json = r.json()
+            if self.valves.LITELLM_PIPELINE_DEBUG:
+                print("Response from LiteLLM user info:")
+                pprint(res_json)
+            users = res_json.get("users", [])
+            # Create the internal user in LiteLLM if they do not already exist, otherwise delete them and recreate
+            if users and users[0]["user_email"] == user_email:
+                if self.valves.LITELLM_PIPELINE_DEBUG:
+                    print(f"Deleting {user_email} since they already exist but we don't have their key")
+                user_id = users[0]["user_id"]
+                # Delete the user so that we can recreate them
+                r = requests.post(
+                    url=f"{self.valves.LITELLM_BASE_URL}/user/delete",
+                    json={
+                        "user_ids": [user_id],
+                    },
+                    headers=r_headers,
+                )
+                r.raise_for_status()
+
+            
             r = requests.post(
                 url=f"{self.valves.LITELLM_BASE_URL}/user/new",
                 json={
@@ -323,29 +354,34 @@ class Pipeline:
             )
             r.raise_for_status()
             res_json = r.json()
+            if self.valves.LITELLM_PIPELINE_DEBUG:  
+                print("Response from LiteLLM user creation:")
+                pprint(res_json)
+            user_id = res_json["user_id"]
+            virtual_key = res_json["key"]
             print("Response from LiteLLM user creation:")
-            pprint(res_json)
 
             # Get the user's virtual key id
             r = requests.get(
-                url=f"{self.valves.LITELLM_BASE_URL}/key/list?page=1&size=10&user_id={res_json['user_id']}&return_full_object=false&include_team_keys=false&sort_order=desc",
+                url=f"{self.valves.LITELLM_BASE_URL}/key/list?page=1&size=10&user_id={user_id}&return_full_object=false&include_team_keys=false&sort_order=desc",
                 headers=r_headers,
             )
             r.raise_for_status()
-            key_id = r.json()["keys"][0]
+            res_json = r.json()
+            key_id = res_json["keys"][0]
+            
             # Assign a budget to the user's key
             r = requests.post(
                 url=f"{self.valves.LITELLM_BASE_URL}/key/update",
                 json={
                     "budget_id": self.valves.LITELLM_USER_BUDGET_NAME,
                     "key": key_id,
-                    "user_id": res_json["user_id"],
+                    "user_id": user_id,
                     "budget_duration": self.valves.LITELLM_USER_BUDGET_PERIOD,
                 },
                 headers=r_headers,
             )
             r.raise_for_status()
-            virtual_key = res_json["key"]
             cursor.execute(
                 "INSERT INTO litellm_user_keys (username, virtualKey) VALUES (%s, %s) ON CONFLICT (username) DO UPDATE SET virtualKey = EXCLUDED.virtualKey;",
                 (user_email, virtual_key),
@@ -421,6 +457,22 @@ class Pipeline:
         )
 
         return virtual_key
+    
+    def user_key_cache_chat_insert(self, user_email: str, virtual_key: str):
+        VIRTUAL_KEY_CACHE[user_email] = (virtual_key, time.time())
+
+    def user_key_cache_get(self, user_email: str) -> Union[str, None]:
+        if user_email in VIRTUAL_KEY_CACHE:
+            cached_key, timestamp = VIRTUAL_KEY_CACHE[user_email]
+            # Check if the cache is still valid (30 minutes)
+            if (time.time() - timestamp) < USER_KEY_CACHE_TIMEOUT:
+                return cached_key
+            else:
+                # Cache expired
+                del VIRTUAL_KEY_CACHE[user_email]
+        return None
+
+ 
 
     # Figure out a user's billing group, either from cache or DB, or fetch from OpenWebUI and store in DB
     # If a billing group is provided, use that one if the user is a member of it
@@ -563,8 +615,6 @@ class Pipeline:
             print("######################################")
 
         headers = {"X-OpenWebUI-User-Email": body["user"]["email"]}
-        # if self.valves.LITELLM_API_KEY:
-        #    headers["Authorization"] = f"Bearer {self.valves.LITELLM_API_KEY}"
 
         r_headers = {
             "Authorization": f"Bearer {self.valves.LITELLM_API_KEY}",
@@ -688,8 +738,10 @@ class Pipeline:
                 if self.valves.LITELLM_PIPELINE_DEBUG:
                     print(f"Final billing group used: {billing_group}")
 
-            elif body["user"]["email"] in VIRTUAL_KEY_CACHE:
-                virtual_key = VIRTUAL_KEY_CACHE[body["user"]["email"]]
+            elif self.user_key_cache_get(body["user"]["email"]) is not None:
+                virtual_key = self.user_key_cache_get(body["user"]["email"])
+                if self.valves.LITELLM_PIPELINE_DEBUG:
+                    print(f"Using cached virtual key for user {body['user']['email']}: {virtual_key}")
             else:
                 if self.valves.LOCAL_DEV:
                     print("Running in local dev mode, checking for budget")
@@ -733,7 +785,7 @@ class Pipeline:
                                 f"Storing virtual key for user {body['user']['email']} in cache: {virtual_key}"
                             )
 
-                VIRTUAL_KEY_CACHE[body["user"]["email"]] = virtual_key
+                self.user_key_cache_chat_insert(body["user"]["email"], virtual_key)
 
             headers["Authorization"] = f"Bearer {virtual_key}"
 
