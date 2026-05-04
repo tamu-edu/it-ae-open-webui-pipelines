@@ -11,6 +11,7 @@ services:
       build:
         context: ${BUILD_DIR}
         dockerfile: Dockerfile
+      platform: linux/amd64
       volumes:
         - pipelines:/app/pipelines
       restart: always

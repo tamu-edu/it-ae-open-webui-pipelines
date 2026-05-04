@@ -626,20 +626,19 @@ class Pipeline:
             "Content-Type": "application/json",
         }
 
-        # We need the user to log into the web console periodically to ensure that they still have access.
-        # This is necessary to ensure that groups are updated and API keys don't work forever if a user loses access.
-        last_chat_date_is_recent = self.last_chat_date_is_recent(
-            body["user"]["id"], openwebui_r_headers
-        )
-        if not last_chat_date_is_recent:
-            return self._format_error_response(
-                "Web Login Required",
-                f"Please log into the web console and create a chat at least once every {self.valves.LAST_CHAT_DATE_REQUIRED_DAYS} days to continue using your API key.",
-            )
-
         try:
             # If teams are enabled and the user is a member of a team, ensure that they have been added
             if self.valves.BILLING_TEAMS_ENABLED:
+                # We need the user to log into the web console periodically to ensure that they still have access.
+                # This is necessary to ensure that groups are updated and API keys don't work forever if a user loses access.
+                last_chat_date_is_recent = self.last_chat_date_is_recent(
+                    body["user"]["id"], openwebui_r_headers
+                )
+                if not last_chat_date_is_recent:
+                    return self._format_error_response(
+                        "Web Login Required",
+                        f"Please log into the web console and create a chat at least once every {self.valves.LAST_CHAT_DATE_REQUIRED_DAYS} days to continue using your API key.",
+                    )
                 if self.valves.LITELLM_PIPELINE_DEBUG:
                     print("Billing teams are enabled, checking for user groups")
 
@@ -886,21 +885,20 @@ class Pipeline:
             "Content-Type": "application/json",
         }
     
-        # Require periodic web login, same as pipe()
-        last_chat_date_is_recent = self.last_chat_date_is_recent(
-            body["user"]["id"], openwebui_r_headers
-        )
-        if not last_chat_date_is_recent:
-            raise HTTPException(
-                status_code=403,
-                detail=self._format_error_response(
-                    "Web Login Required",
-                    f"Please log into the web console and create a chat at least once every {self.valves.LAST_CHAT_DATE_REQUIRED_DAYS} days to continue using your API key.",
-                ),
-            )
-    
         try:
             if self.valves.BILLING_TEAMS_ENABLED:
+                # Require periodic web login, same as pipe()
+                last_chat_date_is_recent = self.last_chat_date_is_recent(
+                    body["user"]["id"], openwebui_r_headers
+                )
+                if not last_chat_date_is_recent:
+                    raise HTTPException(
+                        status_code=403,
+                        detail=self._format_error_response(
+                            "Web Login Required",
+                            f"Please log into the web console and create a chat at least once every {self.valves.LAST_CHAT_DATE_REQUIRED_DAYS} days to continue using your API key.",
+                        ),
+                    )
                 if self.valves.LITELLM_PIPELINE_DEBUG:
                     print("Billing teams are enabled, checking for user groups")
     

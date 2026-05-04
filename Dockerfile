@@ -1,4 +1,4 @@
-FROM python:3.11-slim-bookworm AS base
+FROM --platform=linux/amd64 python:3.11-slim-bookworm AS base
 
 # Use args
 ARG MINIMUM_BUILD
