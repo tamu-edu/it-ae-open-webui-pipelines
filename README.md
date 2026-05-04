@@ -5,6 +5,8 @@
 # Pipelines: UI-Agnostic OpenAI API Plugin Framework
 
 > [!TIP]
+> **DO NOT USE PIPELINES!**
+>
 > If your goal is simply to add support for additional providers like Anthropic or basic filters, you likely don't need Pipelines . For those cases, Open WebUI Functions are a better fit—it's built-in, much more convenient, and easier to configure. Pipelines, however, comes into play when you're dealing with computationally heavy tasks (e.g., running large models or complex logic) that you want to offload from your main Open WebUI instance for better performance and scalability.
 
 
@@ -21,6 +23,7 @@ Welcome to **Pipelines**, an [Open WebUI](https://github.com/open-webui) initiat
 - [**Function Calling Pipeline**](/examples/filters/function_calling_filter_pipeline.py): Easily handle function calls and enhance your applications with custom logic.
 - [**Custom RAG Pipeline**](/examples/pipelines/rag/llamaindex_pipeline.py): Implement sophisticated Retrieval-Augmented Generation pipelines tailored to your needs.
 - [**Message Monitoring Using Langfuse**](/examples/filters/langfuse_filter_pipeline.py): Monitor and analyze message interactions in real-time using Langfuse.
+- [**Message Monitoring Using Opik**](/examples/filters/opik_filter_pipeline.py): Monitor and analyze message interactions using Opik, an open-source platform for debugging and evaluating LLM applications and RAG systems.
 - [**Rate Limit Filter**](/examples/filters/rate_limit_filter_pipeline.py): Control the flow of requests to prevent exceeding rate limits.
 - [**Real-Time Translation Filter with LibreTranslate**](/examples/filters/libretranslate_filter_pipeline.py): Seamlessly integrate real-time translations into your LLM interactions.
 - [**Toxic Message Filter**](/examples/filters/detoxify_filter_pipeline.py): Implement filters to detect and handle toxic messages effectively.
@@ -38,6 +41,8 @@ Integrating Pipelines with any OpenAI API-compatible UI client is simple. Launch
 
 > [!WARNING]
 > Pipelines are a plugin system with arbitrary code execution — **don't fetch random pipelines from sources you don't trust**.
+
+### Docker
 
 For a streamlined setup using Docker:
 
@@ -75,6 +80,45 @@ Alternatively, you can directly install pipelines from the admin settings by cop
 
 That's it! You're now ready to build customizable AI integrations effortlessly with Pipelines. Enjoy!
 
+### Docker Compose together with Open WebUI
+
+Using [Docker Compose](https://docs.docker.com/compose/) simplifies the management of multi-container Docker applications.
+
+Here is an example configuration file `docker-compose.yaml` for setting up Open WebUI together with Pipelines using Docker Compose:
+
+```yaml
+services:
+  openwebui:
+      image: ghcr.io/open-webui/open-webui:main
+      ports:
+        - "3000:8080"
+      volumes:
+        - open-webui:/app/backend/data
+
+  pipelines:
+      image: ghcr.io/open-webui/pipelines:main
+      volumes:
+        - pipelines:/app/pipelines
+      restart: always
+      environment:
+        - PIPELINES_API_KEY=0p3n-w3bu!
+
+volumes:
+  open-webui: {}
+  pipelines: {}
+```
+
+To start your services, run the following command:
+
+```
+docker compose up -d
+```
+
+You can then use `http://pipelines:9099` (the name is the same as the service's name defined in `docker-compose.yaml`) as an API URL to connect to Open WebUI.
+
+> [!NOTE]
+> The `pipelines` service is accessible only by `openwebui` Docker service and thus provide additional layer of security.
+
 ## 📦 Installation and Setup
 
 Get started with Pipelines in a few easy steps:
@@ -100,6 +144,38 @@ Get started with Pipelines in a few easy steps:
    ```
 
 Once the server is running, set the OpenAI URL on your client to the Pipelines URL. This unlocks the full capabilities of Pipelines, integrating any Python library and creating custom workflows tailored to your needs.
+
+### Advanced Docker Builds
+If you create your own pipelines, you can install them when the Docker image is built.  For example,
+create a bash script with the snippet below to collect files from a path, add them as install URLs, 
+and build the Docker image with the new pipelines automatically installed.
+
+NOTE: The pipelines module will still attempt to install any package dependencies found at in your
+file headers at start time, but they will not be downloaded again.
+
+```sh
+# build in the specific pipelines
+PIPELINE_DIR="pipelines-custom"
+# assuming the above directory is in your source repo and not skipped by `.dockerignore`, it will get copied to the image
+PIPELINE_PREFIX="file:///app"
+
+# retrieve all the sub files
+export PIPELINES_URLS=
+for file in "$PIPELINE_DIR"/*; do
+    if [[ -f "$file" ]]; then
+        if [[ "$file" == *.py ]]; then
+            if [ -z "$PIPELINES_URLS" ]; then
+                PIPELINES_URLS="$PIPELINE_PREFIX/$file"
+            else
+                PIPELINES_URLS="$PIPELINES_URLS;$PIPELINE_PREFIX/$file"
+            fi
+        fi
+    fi
+done
+echo "New Custom Install Pipes: $PIPELINES_URLS"
+
+docker build --build-arg PIPELINES_URLS=$PIPELINES_URLS --build-arg MINIMUM_BUILD=true -f Dockerfile .
+```
 
 ## 📂 Directory Structure and Examples
 
