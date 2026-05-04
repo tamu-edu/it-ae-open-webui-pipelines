@@ -14,7 +14,7 @@ from utils.pipelines.misc import convert_to_raw_url
 
 from contextlib import asynccontextmanager
 from concurrent.futures import ThreadPoolExecutor
-from schemas import FilterForm, OpenAIChatCompletionForm
+from schemas import FilterForm, OpenAIChatCompletionForm, OpenAIEmbeddingForm
 from urllib.parse import urlparse
 
 import shutil
@@ -785,5 +785,64 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                         }
                     ],
                 }
+
+    return await run_in_threadpool(job)
+
+
+@app.post("/v1/embeddings")
+@app.post("/embeddings")
+async def generate_embeddings(request: Request, form_data: OpenAIEmbeddingForm):
+    if (
+        form_data.model not in app.state.PIPELINES
+        or app.state.PIPELINES[form_data.model]["type"] == "filter"
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Pipeline {form_data.model} not found",
+        )
+
+    # Build user dict from headers, mirroring what chat completions receives in body["user"]
+    user = {
+        "id": request.headers.get("x-openwebui-user-id", ""),
+        "name": request.headers.get("x-openwebui-user-name", ""),
+        "email": request.headers.get("x-openwebui-user-email", ""),
+        "role": request.headers.get("x-openwebui-user-role", ""),
+    }
+
+    def job():
+        pipeline = app.state.PIPELINES[form_data.model]
+        pipeline_id = form_data.model
+
+        if pipeline["type"] == "manifold":
+            manifold_id, pipeline_id = pipeline_id.split(".", 1)
+            module = PIPELINE_MODULES[manifold_id]
+        else:
+            module = PIPELINE_MODULES[pipeline_id]
+
+        if not hasattr(module, "embed"):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Pipeline {form_data.model} does not support embeddings (no embed() method)",
+            )
+
+        body = form_data.model_dump()
+        body["user"] = user
+
+        res = module.embed(
+            model_id=pipeline_id,
+            body=body,
+        )
+
+        logging.info(f"embeddings:{res}")
+
+        if isinstance(res, dict):
+            return res
+        elif isinstance(res, BaseModel):
+            return res.model_dump()
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Pipeline {form_data.model} embed() returned an unexpected type: {type(res)}",
+            )
 
     return await run_in_threadpool(job)

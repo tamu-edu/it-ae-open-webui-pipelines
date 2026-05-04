@@ -860,3 +860,214 @@ class Pipeline:
                 "Unexpected Error",
                 f"An unexpected error occurred: {str(e)}",
             )
+        
+    def embed(
+        self, model_id: str, body: dict
+    ) -> dict:
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print("Embeddings pipeline debug start")
+            pprint(model_id)
+            pprint(body)
+            print("Embeddings pipeline debug end")
+    
+        if "user" in body:
+            print("######################################")
+            print(f'# User: {body["user"]["name"]} ({body["user"]["id"]})')
+            print(f"# Embedding model: {model_id}")
+            print("######################################")
+    
+        headers = {"X-OpenWebUI-User-Email": body["user"]["email"]}
+        r_headers = {
+            "Authorization": f"Bearer {self.valves.LITELLM_API_KEY}",
+            "Content-Type": "application/json",
+        }
+        openwebui_r_headers = {
+            "Authorization": f"Bearer {self.valves.OPENWEBUI_API_KEY}",
+            "Content-Type": "application/json",
+        }
+    
+        # Require periodic web login, same as pipe()
+        last_chat_date_is_recent = self.last_chat_date_is_recent(
+            body["user"]["id"], openwebui_r_headers
+        )
+        if not last_chat_date_is_recent:
+            raise HTTPException(
+                status_code=403,
+                detail=self._format_error_response(
+                    "Web Login Required",
+                    f"Please log into the web console and create a chat at least once every {self.valves.LAST_CHAT_DATE_REQUIRED_DAYS} days to continue using your API key.",
+                ),
+            )
+    
+        try:
+            if self.valves.BILLING_TEAMS_ENABLED:
+                if self.valves.LITELLM_PIPELINE_DEBUG:
+                    print("Billing teams are enabled, checking for user groups")
+    
+                # Embeddings requests don't carry tools, so no billing_group tool to extract.
+                # Go straight to cache or fetch.
+                billing_group = None
+                last_updated_time = TEAM_LAST_UPDATED.get(body["user"]["email"], 0)
+                expired_cache = (time.time() - last_updated_time) > 1800
+    
+                if body["user"]["email"] in TEAM_USER_GROUP_CACHE and not expired_cache:
+                    billing_group = TEAM_USER_GROUP_CACHE[body["user"]["email"]]
+                    if self.valves.LITELLM_PIPELINE_DEBUG:
+                        print(
+                            f"Using cached billing group for user {body['user']['email']}: {billing_group}"
+                        )
+    
+                if billing_group is None:
+                    billing_group = self.fetch_and_update_user_billing_group(
+                        body["user"]["email"], openwebui_r_headers
+                    )
+    
+                print(
+                    f"User {body['user']['email']} is in billing group {billing_group}"
+                )
+    
+                if billing_group in TEAM_VIRTUAL_KEY_GROUP_CACHE:
+                    virtual_key = TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group]
+                    if self.valves.LITELLM_PIPELINE_DEBUG:
+                        print(
+                            f"Using cached virtual key for team {billing_group}: {virtual_key}"
+                        )
+                else:
+                    print(
+                        f"Fetching virtual key for team {billing_group} from database or creating if missing"
+                    )
+                    with psycopg2.connect(self.valves.DATABASE_URL) as conn:
+                        with conn.cursor() as cursor:
+                            virtual_key = self.get_team_key_and_create_if_missing(
+                                billing_group, r_headers, cursor
+                            )
+                            TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group] = virtual_key
+    
+            elif self.user_key_cache_get(body["user"]["email"]) is not None:
+                virtual_key = self.user_key_cache_get(body["user"]["email"])
+                if self.valves.LITELLM_PIPELINE_DEBUG:
+                    print(
+                        f"Using cached virtual key for user {body['user']['email']}: {virtual_key}"
+                    )
+            else:
+                if self.valves.LOCAL_DEV:
+                    print("Running in local dev mode, checking for budget")
+                    r = requests.post(
+                        url=f"{self.valves.LITELLM_BASE_URL}/budget/info",
+                        json={"budgets": [self.valves.LITELLM_USER_BUDGET_NAME]},
+                        headers=r_headers,
+                    )
+                    r.raise_for_status()
+                    res_json = r.json()
+                    print("Response from LiteLLM budget info:")
+                    pprint(res_json)
+                    if len(res_json) == 0:
+                        r = requests.post(
+                            url=f"{self.valves.LITELLM_BASE_URL}/budget/new",
+                            json={
+                                "budget_id": self.valves.LITELLM_USER_BUDGET_NAME,
+                                "max_budget": self.valves.LITELLM_USER_BUDGET,
+                                "budget_duration": self.valves.LITELLM_USER_BUDGET_PERIOD,
+                            },
+                            headers=r_headers,
+                        )
+                        r.raise_for_status()
+    
+                with psycopg2.connect(self.valves.DATABASE_URL) as conn:
+                    with conn.cursor() as cursor:
+                        create_table_query = """
+                            CREATE TABLE IF NOT EXISTS litellm_user_keys (
+                                username VARCHAR(50) NOT NULL,
+                                virtualKey TEXT NOT NULL,
+                                update_user BOOLEAN DEFAULT FALSE,
+                            CONSTRAINT pk_litellm_user_keys PRIMARY KEY (username)
+                        );
+                        """
+                        cursor.execute(create_table_query)
+                        virtual_key = self.get_user_key_and_create_if_missing(
+                            body["user"]["email"], r_headers, cursor
+                        )
+                        if self.valves.LITELLM_PIPELINE_DEBUG:
+                            print(
+                                f"Storing virtual key for user {body['user']['email']} in cache: {virtual_key}"
+                            )
+                self.user_key_cache_chat_insert(body["user"]["email"], virtual_key)
+    
+            headers["Authorization"] = f"Bearer {virtual_key}"
+    
+            payload = {
+                "model": model_id,
+                "input": body["input"],
+            }
+            # Pass through optional standard embeddings fields if present
+            if "encoding_format" in body:
+                payload["encoding_format"] = body["encoding_format"]
+            if "dimensions" in body:
+                payload["dimensions"] = body["dimensions"]
+            if "user" in body:
+                payload["user"] = body["user"]["email"]
+    
+            if self.valves.LITELLM_PIPELINE_DEBUG:
+                print("Payload for LiteLLM embeddings:")
+                pprint(payload)
+                print("Headers for LiteLLM embeddings:")
+                pprint(headers)
+    
+            r = requests.post(
+                url=f"{self.valves.LITELLM_BASE_URL}/v1/embeddings",
+                json=payload,
+                headers=headers,
+            )
+    
+            if not r.ok:
+                raise HTTPException(
+                    status_code=r.status_code,
+                    detail=self._handle_litellm_error(r),
+                )
+    
+            return r.json()
+    
+        except HTTPException:
+            raise
+        except requests.exceptions.ConnectionError:
+            raise HTTPException(
+                status_code=503,
+                detail=self._format_error_response(
+                    "Connection Error",
+                    "Unable to connect to the AI service. Please check your network connection and try again.",
+                ),
+            )
+        except requests.exceptions.Timeout:
+            raise HTTPException(
+                status_code=504,
+                detail=self._format_error_response(
+                    "Timeout Error",
+                    "The AI service is taking too long to respond. Please try again.",
+                ),
+            )
+        except requests.exceptions.RequestException as e:
+            raise HTTPException(
+                status_code=502,
+                detail=self._format_error_response(
+                    "Network Error",
+                    f"A network error occurred while communicating with the AI service: {str(e)}",
+                ),
+            )
+        except psycopg2.Error as e:
+            print(f"Database error: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=self._format_error_response(
+                    "System Error",
+                    "A system error occurred. Please contact your administrator.",
+                ),
+            )
+        except Exception as e:
+            print(f"Unexpected error: {e}")
+            raise HTTPException(
+                status_code=500,
+                detail=self._format_error_response(
+                    "Unexpected Error",
+                    f"An unexpected error occurred: {str(e)}",
+                ),
+            )
