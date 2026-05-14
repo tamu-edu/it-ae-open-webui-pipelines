@@ -490,7 +490,7 @@ class Pipeline:
             with conn.cursor() as cursor:
                 create_table_query = """
                     CREATE TABLE IF NOT EXISTS litellm_user_last_used_billing_group (
-                        username VARCHAR(50) NOT NULL,
+                        username VARCHAR(255) NOT NULL,
                         billing_group TEXT NOT NULL,
                         update_user BOOLEAN DEFAULT FALSE,
                         created BIGINT NOT NULL,
@@ -769,7 +769,7 @@ class Pipeline:
                     with conn.cursor() as cursor:
                         create_table_query = """
                             CREATE TABLE IF NOT EXISTS litellm_user_keys (
-                                username VARCHAR(50) NOT NULL,
+                                username VARCHAR(255) NOT NULL,
                                 virtualKey TEXT NOT NULL,
                                 update_user BOOLEAN DEFAULT FALSE,
                             CONSTRAINT pk_litellm_user_keys PRIMARY KEY (username)
@@ -975,7 +975,7 @@ class Pipeline:
                     with conn.cursor() as cursor:
                         create_table_query = """
                             CREATE TABLE IF NOT EXISTS litellm_user_keys (
-                                username VARCHAR(50) NOT NULL,
+                                username VARCHAR(255) NOT NULL,
                                 virtualKey TEXT NOT NULL,
                                 update_user BOOLEAN DEFAULT FALSE,
                             CONSTRAINT pk_litellm_user_keys PRIMARY KEY (username)
