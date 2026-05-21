@@ -471,6 +471,20 @@ class Pipeline:
                 # Cache expired
                 del VIRTUAL_KEY_CACHE[user_email]
         return None
+    
+    def team_key_cache_get(self, billing_group: str) -> Union[str, None]:
+        if billing_group in TEAM_VIRTUAL_KEY_GROUP_CACHE:
+            cached_key, timestamp = TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group]
+            # Check if the cache is still valid (30 minutes)
+            if (time.time() - timestamp) < USER_KEY_CACHE_TIMEOUT:
+                return cached_key
+            else:
+                # Cache expired
+                del TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group]
+        return None
+    
+    def team_key_cache_chat_insert(self, billing_group: str, virtual_key: str):
+        TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group] = (virtual_key, time.time())
 
  
 
@@ -717,8 +731,9 @@ class Pipeline:
                     print(
                         f"User {body['user']['email']} is in billing group {billing_group}"
                     )
-                if billing_group in TEAM_VIRTUAL_KEY_GROUP_CACHE:
-                    virtual_key = TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group]
+
+                virtual_key = self.team_key_cache_get(billing_group)
+                if virtual_key is not None:
                     if self.valves.LITELLM_PIPELINE_DEBUG:
                         print(
                             f"Using cached virtual key for team {billing_group}: {virtual_key}"
@@ -732,7 +747,7 @@ class Pipeline:
                             virtual_key = self.get_team_key_and_create_if_missing(
                                 billing_group, r_headers, cursor
                             )
-                            TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group] = virtual_key
+                            self.team_key_cache_chat_insert(billing_group, virtual_key)
 
                 if self.valves.LITELLM_PIPELINE_DEBUG:
                     print(f"Final billing group used: {billing_group}")
