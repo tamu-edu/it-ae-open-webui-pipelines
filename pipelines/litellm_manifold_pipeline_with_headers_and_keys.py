@@ -939,8 +939,8 @@ class Pipeline:
                     f"User {body['user']['email']} is in billing group {billing_group}"
                 )
     
-                if billing_group in TEAM_VIRTUAL_KEY_GROUP_CACHE:
-                    virtual_key = TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group]
+                virtual_key = self.team_key_cache_get(billing_group)
+                if virtual_key is not None:
                     if self.valves.LITELLM_PIPELINE_DEBUG:
                         print(
                             f"Using cached virtual key for team {billing_group}: {virtual_key}"
@@ -954,7 +954,7 @@ class Pipeline:
                             virtual_key = self.get_team_key_and_create_if_missing(
                                 billing_group, r_headers, cursor
                             )
-                            TEAM_VIRTUAL_KEY_GROUP_CACHE[billing_group] = virtual_key
+                            self.team_key_cache_chat_insert(billing_group, virtual_key)
     
             elif self.user_key_cache_get(body["user"]["email"]) is not None:
                 virtual_key = self.user_key_cache_get(body["user"]["email"])
