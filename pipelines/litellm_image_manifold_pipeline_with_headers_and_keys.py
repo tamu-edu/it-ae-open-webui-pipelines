@@ -837,6 +837,27 @@ class Pipeline:
             output = f"{output}\n\n*{revised}*"
         return output
 
+    def _chunk_text(self, text: str, size: int = 60000):
+        """Yield ``text`` in chunks small enough for the framework's SSE stream.
+
+        OpenWebUI reads the pipelines stream with an aiohttp line limit of 131072
+        bytes. A base64 image markdown string is far larger than that as a single
+        SSE line, so we split it. The framework wraps each yielded chunk as a
+        delta.content line (main.py stream_content) and OpenWebUI concatenates the
+        deltas back into the full markdown.
+
+        Boundaries are nudged so a chunk never begins with the literal "data:",
+        which main.py would otherwise misread as a raw pre-formatted SSE line.
+        """
+        i = 0
+        n = len(text)
+        while i < n:
+            end = min(i + size, n)
+            while end < n and text[end : end + 5] == "data:":
+                end -= 1
+            yield text[i:end]
+            i = end
+
     def pipe(
         self, user_message: str, model_id: str, messages: List[dict], body: dict
     ) -> Union[str, Generator, Iterator]:
@@ -1066,8 +1087,11 @@ class Pipeline:
                     return self._handle_litellm_error(r)
 
                 # Render the returned image(s) as markdown so OpenWebUI displays
-                # them inline in the chat, matching the DALL-E manifold example.
-                return self._format_image_response(r.json())
+                # them inline in the chat. gpt-image models return base64 rather
+                # than a URL, so the markdown is large; stream it in small chunks
+                # to stay under the framework's 131072-byte SSE line limit.
+                rendered = self._format_image_response(r.json())
+                return self._chunk_text(rendered)
 
             # --- Chat completions path (unchanged from the original manifold) ---
             payload = {**body, "model": model_id, "user": body["user"]["email"]}
