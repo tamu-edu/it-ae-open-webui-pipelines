@@ -7,7 +7,11 @@ services:
         - open-webui:/app/backend/data
 
   pipelines:
-      image: ghcr.io/open-webui/pipelines:main
+      image: ${IMAGE_NAME}:${IMAGE_TAG}
+      build:
+        context: ${BUILD_DIR}
+        dockerfile: Dockerfile
+      platform: linux/amd64
       volumes:
         - pipelines:/app/pipelines
       restart: always
