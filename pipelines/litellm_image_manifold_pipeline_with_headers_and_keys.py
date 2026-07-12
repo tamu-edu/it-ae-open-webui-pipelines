@@ -1057,11 +1057,13 @@ class Pipeline:
                     )
 
                 if not r.ok:
-                    print("Raising an HTTPException")
-                    raise HTTPException(
-                        status_code=r.status_code,
-                        detail=self._handle_litellm_error(r),
-                    )
+                    # Image requests arrive with stream=true, so pipe() runs inside
+                    # the framework's streaming generator (main.py stream_content).
+                    # Raising here aborts the stream after headers are sent, which
+                    # the client reports as a TransferEncodingError instead of our
+                    # message. Returning the formatted error string lets the
+                    # framework render it as a normal streamed chat message.
+                    return self._handle_litellm_error(r)
 
                 # Render the returned image(s) as markdown so OpenWebUI displays
                 # them inline in the chat, matching the DALL-E manifold example.
