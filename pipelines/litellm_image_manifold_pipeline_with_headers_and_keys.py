@@ -749,6 +749,48 @@ class Pipeline:
             break
         return images
 
+    def _extract_last_conversation_image(self, messages: List[dict]):
+        """Return the most recent image already present in the conversation.
+
+        A previously generated image is fed back to us as an *assistant* message
+        whose content embeds the image as markdown, e.g.
+        ``![image](data:image/png;base64,...)`` (this is exactly what
+        _format_image_response emits). So when the current user turn has no freshly
+        attached image, we walk backwards and reuse the last such image as the edit
+        base — giving conversational "make the kite blue" editing.
+
+        Images may also appear as OpenAI-style multimodal ``image_url`` parts in
+        earlier turns; handle both. Returns a list with a single ``(bytes,
+        mime_type)`` tuple, or an empty list if no image is found.
+        """
+        for message in reversed(messages):
+            content = message.get("content")
+
+            # String content (assistant markdown or plain text): pull the last
+            # base64 data URL out of any ![...](data:image/...;base64,...) markdown.
+            if isinstance(content, str):
+                matches = re.findall(
+                    r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", content
+                )
+                if matches:
+                    decoded = self._decode_data_url(matches[-1])
+                    if decoded:
+                        return [decoded]
+
+            # List content (multimodal parts): check image_url parts.
+            elif isinstance(content, list):
+                for part in reversed(content):
+                    if not isinstance(part, dict):
+                        continue
+                    if part.get("type") != "image_url":
+                        continue
+                    url = (part.get("image_url") or {}).get("url", "")
+                    decoded = self._decode_data_url(url)
+                    if decoded:
+                        return [decoded]
+
+        return []
+
     def _request_image_generation(
         self, model_id: str, prompt: str, size: str, n: int, headers: dict
     ):
@@ -1059,8 +1101,14 @@ class Pipeline:
                 n = body.get("n", 1)
 
                 # If the latest user turn includes an attached image, treat this as
-                # an edit (image-to-image) request; otherwise it is a generation.
+                # an edit (image-to-image) request. Otherwise, fall back to the most
+                # recent image already in the conversation (e.g. one we generated on
+                # a prior turn, fed back as assistant markdown) so follow-ups like
+                # "make the kite blue" edit that image instead of generating anew.
+                # A brand-new chat with no prior image still routes to generation.
                 input_images = self._extract_input_images(messages)
+                if not input_images:
+                    input_images = self._extract_last_conversation_image(messages)
 
                 if input_images:
                     if self.valves.LITELLM_PIPELINE_DEBUG:
