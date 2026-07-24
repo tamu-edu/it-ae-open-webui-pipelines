@@ -3,7 +3,7 @@ title: LiteLLM Manifold Pipeline (chat, embeddings, images)
 author: open-webui
 author: Blake Dworaczyk <blaked@tamu.edu>
 date: 2025-08-11
-version: 2.0.1
+version: 2.1.0
 license: MIT
 description: A unified manifold pipeline that exposes all LiteLLM models (chat, embeddings, and image) in the OpenWebUI model dropdown and tracks spend via per-user (and team-based) virtual keys. Chat models route to /v1/chat/completions and embeddings to /v1/embeddings, exactly as before. Image models route to /v1/images/generations, or to /v1/images/edits when the user attaches an image. Cost is billed against the user's virtual key for every request type.
 """
@@ -749,31 +749,84 @@ class Pipeline:
             break
         return images
 
+    def _fetch_openwebui_file_image(self, file_id: str):
+        """Fetch a stored OpenWebUI file by id, returning ``(bytes, mime_type)``.
+
+        Used to recover a previously generated image for conversational edits when
+        OpenWebUI has converted it from inline base64 to a stored file (referenced
+        as ``/api/v1/files/<id>/content``). The pipeline authenticates with the
+        admin OPENWEBUI_API_KEY, which can read any user's file, so this resolves
+        images regardless of which user owns them. Returns ``None`` on any failure.
+        """
+        base_url = self.valves.OPENWEBUI_BASE_URL
+        api_key = self.valves.OPENWEBUI_API_KEY
+        if not base_url or not api_key:
+            return None
+        try:
+            r = requests.get(
+                url=f"{base_url}/api/v1/files/{file_id}/content",
+                headers={"Authorization": f"Bearer {api_key}"},
+                timeout=30,
+            )
+            r.raise_for_status()
+        except Exception as e:
+            if self.valves.LITELLM_PIPELINE_DEBUG:
+                print(f"Failed to fetch OpenWebUI file {file_id}: {e}")
+            return None
+        mime_type = r.headers.get("content-type", "image/png").split(";")[0].strip()
+        if not mime_type:
+            mime_type = "image/png"
+        return (r.content, mime_type)
+
     def _extract_last_conversation_image(self, messages: List[dict]):
         """Return the most recent image already present in the conversation.
 
         A previously generated image is fed back to us as an *assistant* message
-        whose content embeds the image as markdown, e.g.
-        ``![image](data:image/png;base64,...)`` (this is exactly what
-        _format_image_response emits). So when the current user turn has no freshly
-        attached image, we walk backwards and reuse the last such image as the edit
-        base — giving conversational "make the kite blue" editing.
+        whose content embeds the image. Depending on whether OpenWebUI's base64->
+        file conversion is enabled, that markdown is either an inline data URL
+        ``![image](data:image/png;base64,...)`` (pre-conversion / same-turn
+        attachments) or a stored-file URL ``![image](/api/v1/files/<id>/content)``
+        (post-conversion). So when the current user turn has no freshly attached
+        image, we walk backwards and reuse the last such image as the edit base —
+        giving conversational "make the kite blue" editing.
 
         Images may also appear as OpenAI-style multimodal ``image_url`` parts in
         earlier turns; handle both. Returns a list with a single ``(bytes,
         mime_type)`` tuple, or an empty list if no image is found.
         """
+        file_url_re = re.compile(r"/api/v1/files/([0-9a-fA-F-]{36})/content")
+
         for message in reversed(messages):
             content = message.get("content")
 
             # String content (assistant markdown or plain text): pull the last
-            # base64 data URL out of any ![...](data:image/...;base64,...) markdown.
+            # image reference out of the markdown. Two shapes are possible:
+            # an inline base64 data URL, or a converted /api/v1/files/<id>/content
+            # URL. Prefer whichever appears last in the text.
             if isinstance(content, str):
-                matches = re.findall(
-                    r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", content
+                data_matches = list(
+                    re.finditer(
+                        r"data:image/[^;]+;base64,[A-Za-z0-9+/=]+", content
+                    )
                 )
-                if matches:
-                    decoded = self._decode_data_url(matches[-1])
+                url_matches = list(file_url_re.finditer(content))
+                # Pick the reference that appears latest in the string so the most
+                # recent image in a multi-image assistant turn wins.
+                last_data = data_matches[-1] if data_matches else None
+                last_url = url_matches[-1] if url_matches else None
+                candidate = None
+                if last_data and last_url:
+                    candidate = (
+                        last_data if last_data.start() > last_url.start() else last_url
+                    )
+                else:
+                    candidate = last_data or last_url
+
+                if candidate is not None:
+                    if candidate is last_data:
+                        decoded = self._decode_data_url(candidate.group(0))
+                    else:
+                        decoded = self._fetch_openwebui_file_image(candidate.group(1))
                     if decoded:
                         return [decoded]
 
@@ -786,6 +839,10 @@ class Pipeline:
                         continue
                     url = (part.get("image_url") or {}).get("url", "")
                     decoded = self._decode_data_url(url)
+                    if not decoded:
+                        m = file_url_re.search(url or "")
+                        if m:
+                            decoded = self._fetch_openwebui_file_image(m.group(1))
                     if decoded:
                         return [decoded]
 
@@ -882,11 +939,16 @@ class Pipeline:
     def _chunk_text(self, text: str, size: int = 60000):
         """Yield ``text`` in chunks small enough for the framework's SSE stream.
 
-        OpenWebUI reads the pipelines stream with an aiohttp line limit of 131072
-        bytes. A base64 image markdown string is far larger than that as a single
-        SSE line, so we split it. The framework wraps each yielded chunk as a
-        delta.content line (main.py stream_content) and OpenWebUI concatenates the
-        deltas back into the full markdown.
+        NOTE: no longer used by pipe() — image responses are now returned as a
+        single string so OpenWebUI's per-delta base64->file conversion can match
+        the full data URL. Retained as a fallback for environments that reinstate
+        a per-line SSE cap (e.g. OpenWebUI with CHAT_STREAM_RESPONSE_CHUNK_MAX_
+        BUFFER_SIZE set, or older versions with the 131072-byte aiohttp limit).
+
+        A base64 image markdown string can be larger than a per-line limit as a
+        single SSE line, so we split it. The framework wraps each yielded chunk as
+        a delta.content line (main.py stream_content) and OpenWebUI concatenates
+        the deltas back into the full markdown.
 
         Boundaries are nudged so a chunk never begins with the literal "data:",
         which main.py would otherwise misread as a raw pre-formatted SSE line.
@@ -1135,11 +1197,19 @@ class Pipeline:
                     return self._handle_litellm_error(r)
 
                 # Render the returned image(s) as markdown so OpenWebUI displays
-                # them inline in the chat. gpt-image models return base64 rather
-                # than a URL, so the markdown is large; stream it in small chunks
-                # to stay under the framework's 131072-byte SSE line limit.
+                # them inline in the chat. Return the whole markdown as a single
+                # string (one SSE delta) rather than chunking it: OpenWebUI's
+                # ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION runs its
+                # base64 -> /api/v1/files/<id>/content rewrite per-delta, so a
+                # data URL split across chunks would never match and never be
+                # converted. Emitting one delta lets that conversion fire (which
+                # also removes the base64 "gibberish" that used to stream to the
+                # browser). The old 131072-byte SSE line limit that motivated
+                # chunking no longer applies on OpenWebUI 0.10.2 (its upstream
+                # reader, stream_chunks_handler, has no per-line cap unless
+                # CHAT_STREAM_RESPONSE_CHUNK_MAX_BUFFER_SIZE is set).
                 rendered = self._format_image_response(r.json())
-                return self._chunk_text(rendered)
+                return rendered
 
             # --- Chat completions path (unchanged from the original manifold) ---
             payload = {**body, "model": model_id, "user": body["user"]["email"]}
