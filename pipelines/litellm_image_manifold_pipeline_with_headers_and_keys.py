@@ -233,10 +233,15 @@ class Pipeline:
             if user_spend_match and user_budget_match:
                 user_spend = user_spend_match.group(1)
                 user_budget = user_budget_match.group(1)
-                return f"""You have exceeded your daily budget for AI resources:
-                    • Your current spend: ${round(float(user_spend), 2)}
-                    • Your daily budget: ${round(float(user_budget), 2)}
-                """
+                # Built by concatenation rather than a triple-quoted string on
+                # purpose: source indentation inside a triple-quoted literal is
+                # part of the value, and 4+ leading spaces make Markdown render
+                # the whole thing as an indented code block instead of a list.
+                return (
+                    "You have exceeded your daily budget for AI resources:\n"
+                    f"- Your current spend: ${float(user_spend):.2f}\n"
+                    f"- Your daily budget: ${float(user_budget):.2f}"
+                )
 
         elif "Budget has been exceeded!" in error_message:
             user_spend_match = re.search(r"Current cost: ([\d.]+)", error_message)
@@ -245,12 +250,68 @@ class Pipeline:
             if user_spend_match and user_budget_match:
                 user_spend = user_spend_match.group(1)
                 user_budget = user_budget_match.group(1)
-                return f"""You have exceeded your daily budget for AI resources:
-                    • Your current spend: ${round(float(user_spend), 2)}
-                    • Your daily budget: ${round(float(user_budget), 2)}
-                """
+                # Built by concatenation rather than a triple-quoted string on
+                # purpose: source indentation inside a triple-quoted literal is
+                # part of the value, and 4+ leading spaces make Markdown render
+                # the whole thing as an indented code block instead of a list.
+                return (
+                    "You have exceeded your daily budget for AI resources:\n"
+                    f"- Your current spend: ${float(user_spend):.2f}\n"
+                    f"- Your daily budget: ${float(user_budget):.2f}"
+                )
 
         return error_message
+
+    # Substrings LiteLLM uses for a context-window overflow. The wording differs
+    # per provider (OpenAI/Azure, Bedrock/Anthropic, Vertex), so match on any of
+    # them rather than on a single canonical phrase.
+    CONTEXT_WINDOW_MARKERS = (
+        "ContextWindowExceededError",
+        "context_length_exceeded",
+        "maximum context length",
+        "prompt is too long",
+        "exceed context limit",
+    )
+
+    def _is_context_window_error(self, error_message: str) -> bool:
+        lowered = error_message.lower()
+        return any(m.lower() in lowered for m in self.CONTEXT_WINDOW_MARKERS)
+
+    def _format_context_window_error(self, error_message: str) -> str:
+        """Explain a context-window overflow and what the user can do about it."""
+        limit = used = None
+
+        # OpenAI / Azure: "This model's maximum context length is 128000 tokens.
+        # However, your messages resulted in 130000 tokens."
+        limit_match = re.search(
+            r"maximum context length is ([\d,]+) tokens", error_message
+        )
+        used_match = re.search(r"resulted in ([\d,]+) tokens", error_message)
+
+        # Anthropic / Bedrock: "prompt is too long: 210000 tokens > 200000 maximum"
+        if not (limit_match and used_match):
+            alt = re.search(
+                r"prompt is too long: ([\d,]+) tokens > ([\d,]+) maximum",
+                error_message,
+            )
+            if alt:
+                used, limit = alt.group(1), alt.group(2)
+        else:
+            limit, used = limit_match.group(1), used_match.group(1)
+
+        lines = ["This conversation is too long for the model to process."]
+
+        if limit and used:
+            lines.append(f"- Tokens in this request: {used}")
+            lines.append(f"- Maximum this model accepts: {limit}")
+
+        lines.append("")
+        lines.append("You can:")
+        lines.append("- Start a new chat to clear the conversation history")
+        lines.append("- Remove or shorten any large attachments or pasted text")
+        lines.append("- Switch to a model with a larger context window")
+
+        return "\n".join(lines)
 
     def _format_error_response(
         self, error_type: str, error_message: str, status_code: int = None
@@ -312,6 +373,38 @@ class Pipeline:
                         "Your request was blocked by content filters.",
                         400,
                     )
+
+            # Context window exceeded. LiteLLM reports this as a 400 with the token
+            # counts in the message; without this branch it fell through to the
+            # generic formatter and surfaced the raw
+            # "litellm.ContextWindowExceededError: ... Received Model Group=..."
+            # string.
+            elif self._is_context_window_error(error_message):
+                return self._format_error_response(
+                    "Conversation Too Long",
+                    self._format_context_window_error(error_message),
+                    400,
+                )
+
+        # Rate limits. Per-user rpm/tpm limits are enforced by LiteLLM, so this is
+        # usually self-inflicted by rapid requests rather than a provider outage.
+        elif response.status_code == 429:
+            return self._format_error_response(
+                "Rate Limit Reached",
+                "You are sending requests faster than your account allows. "
+                "Please wait a moment and try again.",
+                429,
+            )
+
+        # Key/permission problems. These are actionable by an administrator, not by
+        # the user, so say so rather than showing a raw auth error.
+        elif response.status_code in (401, 403):
+            return self._format_error_response(
+                "Access Denied",
+                "Your account is not authorized to use this model. "
+                "If you believe this is a mistake, please contact your administrator.",
+                response.status_code,
+            )
 
         return self._format_error_response(
             error_type, error_message, response.status_code
@@ -1188,12 +1281,21 @@ class Pipeline:
                     )
 
                 if not r.ok:
-                    # Image requests arrive with stream=true, so pipe() runs inside
-                    # the framework's streaming generator (main.py stream_content).
-                    # Raising here aborts the stream after headers are sent, which
-                    # the client reports as a TransferEncodingError instead of our
-                    # message. Returning the formatted error string lets the
-                    # framework render it as a normal streamed chat message.
+                    # Returned rather than raised so the error arrives as a normal
+                    # streamed chat message.
+                    #
+                    # Historically this was mandatory: pipe() ran inside the
+                    # framework's streaming generator, so raising aborted the stream
+                    # after headers were sent and the client reported a
+                    # TransferEncodingError instead of our message. main.py now
+                    # evaluates pipe() before the response starts, so raising here
+                    # would work and would surface as a proper HTTP error. It is
+                    # kept as a return deliberately: the image path renders its
+                    # payload as a single SSE delta (see the note below about
+                    # ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION), and keeping
+                    # success and failure on the same rendering path avoids
+                    # disturbing that. Switch to raise if image errors should show
+                    # up in the error banner instead of the chat transcript.
                     return self._handle_litellm_error(r)
 
                 # Render the returned image(s) as markdown so OpenWebUI displays
@@ -1245,10 +1347,18 @@ class Pipeline:
                 stream=True,
             )
 
-            # Handle any HTTP error status codes, but only if streaming (in the
-            # interface). We do this because we want scripts to error out, and this
-            # prevents that, although it does provide proper error information.
-            if not r.ok and body["stream"]:
+            # Raise on any upstream error, streaming or not.
+            #
+            # This used to be gated on body["stream"] so that scripts would "error
+            # out" on the non-streaming path -- but the fallthrough below returns
+            # r.json(), i.e. LiteLLM's *error* envelope, which the framework then
+            # emits as HTTP 200. That is the opposite of erroring out: a script got
+            # a success status with an error body, and OpenWebUI's non-streaming
+            # callers (title and tag generation) got a response with no choices.
+            # Raising with the upstream status is what actually makes clients fail
+            # loudly, and it is safe on the streaming path now that main.py
+            # evaluates pipe() before the response headers are sent.
+            if not r.ok:
                 print("Raising an HTTPException")
                 raise HTTPException(
                     status_code=r.status_code, detail=self._handle_litellm_error(r)
