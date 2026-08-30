@@ -686,14 +686,48 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
             pipe = PIPELINE_MODULES[pipeline_id].pipe
 
         if form_data.stream:
+            # Call pipe() BEFORE building the StreamingResponse. Starlette sends
+            # http.response.start (status line + headers) before it pulls the first
+            # item from a streaming generator, so anything raised inside the
+            # generator lands after the response has already begun -- the status
+            # code is unchangeable and the connection just aborts mid-stream. The
+            # client sees a truncated chunked body (TransferEncodingError) and
+            # OpenWebUI reports a generic connection error instead of the
+            # descriptive message the pipeline built.
+            #
+            # Pipelines that talk to an upstream with requests.post(..., stream=True)
+            # already know the upstream status by the time pipe() returns, so
+            # evaluating it here lets an HTTPException propagate through
+            # run_in_threadpool() and be rendered by FastAPI as a real error
+            # response ({"detail": ...} with the upstream status), which OpenWebUI
+            # forwards to the user verbatim.
+            res = pipe(
+                user_message=user_message,
+                model_id=pipeline_id,
+                messages=messages,
+                body=form_data.model_dump(),
+            )
+
+            def finish_events():
+                finish_message = {
+                    "id": f"{form_data.model}-{str(uuid.uuid4())}",
+                    "object": "chat.completion.chunk",
+                    "created": int(time.time()),
+                    "model": form_data.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "logprobs": None,
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+
+                yield f"data: {json.dumps(finish_message)}\n\n"
+                yield f"data: [DONE]"
 
             def stream_content():
-                res = pipe(
-                    user_message=user_message,
-                    model_id=pipeline_id,
-                    messages=messages,
-                    body=form_data.model_dump(),
-                )
                 logging.info(f"stream:true:{res}")
 
                 if isinstance(res, str):
@@ -702,45 +736,55 @@ async def generate_openai_chat_completion(form_data: OpenAIChatCompletionForm):
                     yield f"data: {json.dumps(message)}\n\n"
 
                 if isinstance(res, Iterator):
-                    for line in res:
-                        if isinstance(line, BaseModel):
-                            line = line.model_dump_json()
-                            line = f"data: {line}"
+                    try:
+                        for line in res:
+                            if isinstance(line, BaseModel):
+                                line = line.model_dump_json()
+                                line = f"data: {line}"
 
-                        elif isinstance(line, dict):
-                            line = json.dumps(line)
-                            line = f"data: {line}"
+                            elif isinstance(line, dict):
+                                line = json.dumps(line)
+                                line = f"data: {line}"
 
-                        try:
-                            line = line.decode("utf-8")
-                            logging.info(f"stream_content:Generator:{line}")
-                        except:
-                            pass
+                            try:
+                                line = line.decode("utf-8")
+                                logging.info(f"stream_content:Generator:{line}")
+                            except:
+                                pass
 
-                        if isinstance(line, str) and line.startswith("data:"):
-                            yield f"{line}\n\n"
-                        else:
-                            line = stream_message_template(form_data.model, line)
-                            yield f"data: {json.dumps(line)}\n\n"
+                            if isinstance(line, str) and line.startswith("data:"):
+                                yield f"{line}\n\n"
+                            else:
+                                line = stream_message_template(form_data.model, line)
+                                yield f"data: {json.dumps(line)}\n\n"
+                    except Exception as e:
+                        # Safety net for failures that only surface once iteration
+                        # has started. The important case is a pipeline whose pipe()
+                        # is itself a generator function: calling it above returns a
+                        # generator without executing the body, so hoisting cannot
+                        # catch anything and the error lands here instead.
+                        #
+                        # Headers are long gone by this point, so raising would abort
+                        # the stream and lose the message (see the comment on the
+                        # hoist above). Emitting it as a normal chat delta is the
+                        # only way to get it in front of the user.
+                        #
+                        # Deliberately `Exception`, not `BaseException`: GeneratorExit
+                        # and asyncio.CancelledError must keep propagating, otherwise
+                        # a client disconnect gets reported to the user as a model
+                        # error.
+                        detail = e.detail if isinstance(e, HTTPException) else str(e)
+                        logging.exception(
+                            "stream_content: pipeline failed mid-stream, "
+                            "surfacing the error as a chat message"
+                        )
+                        message = stream_message_template(form_data.model, str(detail))
+                        yield f"data: {json.dumps(message)}\n\n"
+                        yield from finish_events()
+                        return
 
                 if isinstance(res, str) or isinstance(res, Generator):
-                    finish_message = {
-                        "id": f"{form_data.model}-{str(uuid.uuid4())}",
-                        "object": "chat.completion.chunk",
-                        "created": int(time.time()),
-                        "model": form_data.model,
-                        "choices": [
-                            {
-                                "index": 0,
-                                "delta": {},
-                                "logprobs": None,
-                                "finish_reason": "stop",
-                            }
-                        ],
-                    }
-
-                    yield f"data: {json.dumps(finish_message)}\n\n"
-                    yield f"data: [DONE]"
+                    yield from finish_events()
 
             return StreamingResponse(stream_content(), media_type="text/event-stream")
         else:
