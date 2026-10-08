@@ -224,43 +224,108 @@ class Pipeline:
                 },
             ]
 
+    # How a budget_duration reads in a sentence. LiteLLM accepts values like
+    # "1d"/"7d"/"30d"/"1mo"; anything unrecognised gets wording that does not
+    # promise a reset interval we cannot name.
+    BUDGET_PERIOD_LABELS = {
+        "1d": "daily",
+        "7d": "weekly",
+        "30d": "monthly",
+        "1mo": "monthly",
+    }
+
+    # Amount pairs as LiteLLM writes them, which differs per budget check
+    # (litellm/proxy/auth/auth_checks.py):
+    #   "Current cost: 10.39, Max budget: 10.0"  virtual-key max_budget
+    #   "Spend=12.5, Budget=10.0"                user / end-user budget
+    #   "Spend=$12.3456, Limit=$10.00"           key / team rolling-window budget
+    # The "$" is optional because only the window checks format with one, and
+    # the window checks say "Limit" where the others say "Budget".
+    BUDGET_AMOUNT_PATTERNS = (
+        (r"Current cost: \$?([\d.]+)", r"Max budget: \$?([\d.]+)"),
+        (r"Spend=\$?([\d.]+)", r"(?:Budget|Limit)=\$?([\d.]+)"),
+    )
+
+    # Why every budget message ends with advice: the spend is dominated by input
+    # tokens, and a chat with attached documents re-sends the whole transcript
+    # plus its retrieved context on every single turn. Users read "budget
+    # exceeded" as "I sent too many messages", when the real driver is usually
+    # the size of one long conversation.
+    BUDGET_ADVICE = (
+        "Long conversations use this up quickly, especially ones with attached "
+        "documents or knowledge collections, because the entire conversation is "
+        "re-sent to the model on every turn. Starting a new chat, or using a "
+        "lower-cost model, will stretch your budget further."
+    )
+
+    # A team budget is shared, so nothing the user does on their own necessarily
+    # frees it up and the advice above does not apply to them.
+    SHARED_BUDGET_ADVICE = (
+        "This budget is shared by everyone on your team, so it can run out "
+        "because of other members' usage as well as your own. If you need it "
+        "raised, contact your administrator."
+    )
+
+    def _budget_period_label(self, error_message: str = "") -> str:
+        """Human wording for whichever budget period actually tripped."""
+        # The rolling-window checks name the period in the message itself
+        # ("... over 1d budget"), which is authoritative for the budget that
+        # tripped; the per-user valve is only a fallback for the other checks.
+        match = re.search(r"over (\S+) budget", error_message)
+        period = (
+            match.group(1)
+            if match
+            else (self.valves.LITELLM_USER_BUDGET_PERIOD or "")
+        )
+        return self.BUDGET_PERIOD_LABELS.get(period.strip().lower(), "")
+
     def _format_budget_error(self, error_message: str) -> str:
         """Format budget exceeded error messages in a user-friendly way."""
-        if "ExceededBudget" in error_message:
-            user_spend_match = re.search(r"Spend=([\d.]+)", error_message)
-            user_budget_match = re.search(r"Budget=([\d.]+)", error_message)
+        # "Team=" only appears in the team budget checks; every other check
+        # names a key, a user or an end user, i.e. this user's own budget.
+        shared = "Team=" in error_message
+        period = self._budget_period_label(error_message)
 
-            if user_spend_match and user_budget_match:
-                user_spend = user_spend_match.group(1)
-                user_budget = user_budget_match.group(1)
+        if shared:
+            budget_label = f"shared {period} budget" if period else "shared budget"
+            owner = "your team has"
+            advice = self.SHARED_BUDGET_ADVICE
+        else:
+            budget_label = f"{period} budget" if period else "budget"
+            owner = "you have"
+            advice = self.BUDGET_ADVICE
+
+        reset_hint = (
+            f"This budget resets {period}."
+            if period
+            else "This budget resets at the start of the next budget period."
+        )
+
+        for spend_pattern, budget_pattern in self.BUDGET_AMOUNT_PATTERNS:
+            spend_match = re.search(spend_pattern, error_message)
+            budget_match = re.search(budget_pattern, error_message)
+
+            if spend_match and budget_match:
                 # Built by concatenation rather than a triple-quoted string on
                 # purpose: source indentation inside a triple-quoted literal is
                 # part of the value, and 4+ leading spaces make Markdown render
                 # the whole thing as an indented code block instead of a list.
                 return (
-                    "You have exceeded your daily budget for AI resources:\n"
-                    f"- Your current spend: ${float(user_spend):.2f}\n"
-                    f"- Your daily budget: ${float(user_budget):.2f}"
+                    f"{owner.capitalize()} used the full {budget_label} "
+                    "for AI resources:\n"
+                    f"- Current spend: ${float(spend_match.group(1)):.2f}\n"
+                    f"- Budget: ${float(budget_match.group(1)):.2f}\n"
+                    f"\n{reset_hint} {advice}"
                 )
 
-        elif "Budget has been exceeded!" in error_message:
-            user_spend_match = re.search(r"Current cost: ([\d.]+)", error_message)
-            user_budget_match = re.search(r"Max budget: ([\d.]+)", error_message)
-
-            if user_spend_match and user_budget_match:
-                user_spend = user_spend_match.group(1)
-                user_budget = user_budget_match.group(1)
-                # Built by concatenation rather than a triple-quoted string on
-                # purpose: source indentation inside a triple-quoted literal is
-                # part of the value, and 4+ leading spaces make Markdown render
-                # the whole thing as an indented code block instead of a list.
-                return (
-                    "You have exceeded your daily budget for AI resources:\n"
-                    f"- Your current spend: ${float(user_spend):.2f}\n"
-                    f"- Your daily budget: ${float(user_budget):.2f}"
-                )
-
-        return error_message
+        # Deliberately not echoing `error_message`: LiteLLM embeds the key
+        # owner's address and a key prefix in it ("Key=someone@example.com
+        # (sk-...abcd)"), which does not belong in a chat transcript that the
+        # user may well go on to share.
+        return (
+            f"{owner.capitalize()} used the full {budget_label} for AI "
+            f"resources. {reset_hint} {advice}"
+        )
 
     # Substrings LiteLLM uses for a context-window overflow. The wording differs
     # per provider (OpenAI/Azure, Bedrock/Anthropic, Vertex), so match on any of
@@ -345,20 +410,29 @@ class Pipeline:
         error_type = error_info.get("type", "Service Error")
         # error_code = error_info.get("code", None)
 
+        # Budget exhaustion, checked ahead of every status-code branch on
+        # purpose. LiteLLM's BudgetExceededError hardcodes status_code = 429
+        # (litellm/exceptions.py) and the proxy re-raises it as a
+        # ProxyException with type "budget_exceeded" and that same code. While
+        # this check sat under `status_code == 400` it could never run, so the
+        # 429 branch below caught every out-of-budget user and told them they
+        # were sending requests too fast -- advice that cannot help, since
+        # nothing changes until the budget period rolls over.
+        if (
+            error_type == "budget_exceeded"
+            or "ExceededBudget" in error_message
+            or "Budget has been exceeded!" in error_message
+        ):
+            return self._format_error_response(
+                "Budget Exceeded",
+                self._format_budget_error(error_message),
+                response.status_code,
+            )
+
         ## Handle specific error types with custom formatting
         if response.status_code == 400:
-            # Budget exceeded errors
-            if (
-                "ExceededBudget" in error_message
-                or "Budget has been exceeded!" in error_message
-            ):
-                formatted_budget_error = self._format_budget_error(error_message)
-                return self._format_error_response(
-                    "Budget Exceeded", formatted_budget_error, 400
-                )
-
             # Guardrail responses
-            elif "bedrock_guardrail_response" in json.dumps(res):
+            if "bedrock_guardrail_response" in json.dumps(res):
                 try:
                     error_message = ast.literal_eval(res["error"]["message"])
                     blocked_response = error_message["bedrock_guardrail_response"][
@@ -386,8 +460,11 @@ class Pipeline:
                     400,
                 )
 
-        # Rate limits. Per-user rpm/tpm limits are enforced by LiteLLM, so this is
-        # usually self-inflicted by rapid requests rather than a provider outage.
+        # Genuine rpm/tpm rate limits. Budget exhaustion also arrives as a 429
+        # and is handled above, so do not fold the two together again. Note that
+        # the binding ceiling is not always the user's own: the shared team
+        # tpm_limit can be lower than the per-user one, in which case a handful
+        # of large concurrent requests rate-limits an uninvolved user.
         elif response.status_code == 429:
             return self._format_error_response(
                 "Rate Limit Reached",
