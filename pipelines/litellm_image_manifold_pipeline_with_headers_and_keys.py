@@ -73,6 +73,18 @@ class Pipeline:
         IMAGE_MODELS: str = ""
         # Default image size sent to LiteLLM when OpenWebUI does not supply one.
         IMAGE_SIZE: str = "1024x1024"
+        # Anthropic prompt caching. Every turn of a chat re-sends the whole
+        # conversation plus any injected knowledge-base context, so without
+        # caching a knowledge-backed assistant re-bills its entire prefix at
+        # full price on every message.
+        PROMPT_CACHING_ENABLED: bool = True
+        # Cache entry lifetime. "5m" is cheaper to write (1.25x vs 2x base) but
+        # only pays off when turns start less than five minutes apart; real
+        # chats routinely pause longer than that, which misses the cache
+        # entirely and re-charges the full prefix. LiteLLM silently drops the
+        # ttl for models whose pricing entry does not advertise extended-TTL
+        # support, so "1h" degrades to the 5m default rather than erroring.
+        PROMPT_CACHE_TTL: str = "1h"
 
     def __init__(self):
         # You can also set the pipelines that are available in this pipeline.
@@ -96,6 +108,11 @@ class Pipeline:
         # pipe() consults this to decide whether to route a request to the image
         # endpoints instead of /v1/chat/completions.
         self.image_model_ids = set()
+
+        # Set of model ids that take explicit Anthropic cache_control markers
+        # (populated by get_litellm_models). Empty until that call succeeds,
+        # which is the safe default: no markers simply means no caching.
+        self.prompt_cache_model_ids = set()
 
         # Initialize rate limits
         self.valves = self.Valves(
@@ -181,21 +198,29 @@ class Pipeline:
         # Auto-detect image models from /model/info by their mode. This is
         # best-effort: if it fails we still serve the full model list from
         # /v1/models below and rely on the valve for image classification.
+        # The same pass records which models accept explicit cache_control.
+        prompt_cache_model_ids = set()
         try:
             r = requests.get(
                 f"{self.valves.LITELLM_BASE_URL}/model/info", headers=headers
             )
             r.raise_for_status()
             for model in r.json().get("data", []):
-                mode = (model.get("model_info") or {}).get("mode")
-                if mode == "image_generation":
-                    model_id = model.get("model_name")
+                model_info = model.get("model_info") or {}
+                model_id = model.get("model_name")
+                if model_info.get("mode") == "image_generation":
                     if model_id:
                         image_model_ids.add(model_id)
+                if model_id and self._accepts_cache_control(model, model_info):
+                    prompt_cache_model_ids.add(model_id)
         except Exception as e:
             print(f"Error fetching /model/info for image detection: {e}")
 
         self.image_model_ids = image_model_ids
+        self.prompt_cache_model_ids = prompt_cache_model_ids
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print("Models accepting explicit cache_control:")
+            pprint(sorted(prompt_cache_model_ids))
         if self.valves.LITELLM_PIPELINE_DEBUG:
             print("Image models detected/overridden:")
             pprint(sorted(image_model_ids))
@@ -393,6 +418,139 @@ class Pipeline:
             formatted_message += f"\n\n*Error Code: {status_code}*"
 
         return formatted_message
+
+    # Substrings that mark an Anthropic model, whatever route it comes in on:
+    # "anthropic/claude-...", "bedrock/us.anthropic.claude-...",
+    # "vertex_ai/claude-...". Checked against the underlying model rather than
+    # the dropdown alias, because the alias is operator-chosen ("Claude Opus
+    # 4.7", but also "protected.Whatever") and carries no provider guarantee.
+    ANTHROPIC_MODEL_MARKERS = ("anthropic", "claude")
+
+    @classmethod
+    def _accepts_cache_control(cls, model: dict, model_info: dict) -> bool:
+        """Whether this model wants explicit Anthropic cache_control markers.
+
+        Deliberately narrower than model_info's own supports_prompt_caching
+        flag: that is also true for OpenAI models, which cache automatically
+        server-side and have no cache_control field. Sending markers there is
+        at best ignored and at worst a 400, so require both the capability flag
+        and an Anthropic underlying model.
+        """
+        if not model_info.get("supports_prompt_caching"):
+            return False
+        underlying = str((model.get("litellm_params") or {}).get("model") or "").lower()
+        return any(marker in underlying for marker in cls.ANTHROPIC_MODEL_MARKERS)
+
+    @staticmethod
+    def _already_has_cache_control(messages: list) -> bool:
+        """Whether anything upstream already placed a breakpoint."""
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("cache_control"):
+                return True
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("cache_control"):
+                        return True
+        return False
+
+    @staticmethod
+    def _mark_cache_breakpoint(message: dict, cache_control: dict) -> bool:
+        """Attach a breakpoint to a message's last cacheable text block.
+
+        Returns whether a marker was placed. A plain string body is promoted to
+        a single text block, which is the form LiteLLM's providers read the
+        marker from and is equivalent for chat completions.
+        """
+        content = message.get("content")
+
+        if isinstance(content, str):
+            if not content.strip():
+                return False
+            message["content"] = [
+                {"type": "text", "text": content, "cache_control": dict(cache_control)}
+            ]
+            return True
+
+        if isinstance(content, list):
+            # Mark the last text block, not simply the last block: a trailing
+            # image or audio part is not a useful breakpoint, and the text that
+            # precedes it is the bulk of the tokens.
+            for block in reversed(content):
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and str(block.get("text") or "").strip()
+                ):
+                    block["cache_control"] = dict(cache_control)
+                    return True
+
+        # Anything else (tool-call-only assistant turns, null content) has no
+        # text to cache.
+        return False
+
+    def _apply_prompt_caching(self, payload: dict, model_id: str) -> None:
+        """Place Anthropic cache breakpoints on a chat-completions payload.
+
+        Two breakpoints, which is what this shape of traffic needs:
+
+        1. The last system message. OpenWebUI puts the workspace model's system
+           prompt there, and injects knowledge-base context into it, so this is
+           the large and mostly unchanging part of the prefix.
+        2. The final message. This is written on the turn it appears and read
+           back on the next one, so the conversation history accumulates as
+           cache hits instead of being re-billed in full each turn. Writes only
+           cover the delta past the previous hit, so the marker is cheap.
+
+        Anthropic allows at most four breakpoints per request; using two leaves
+        room for anything added later. Mutates ``payload`` in place.
+        """
+        if not self.valves.PROMPT_CACHING_ENABLED:
+            return
+        if model_id not in self.prompt_cache_model_ids:
+            return
+
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return
+
+        # Respect a caller that has already placed breakpoints rather than
+        # risk exceeding the four-breakpoint limit.
+        if self._already_has_cache_control(messages):
+            return
+
+        cache_control = {"type": "ephemeral"}
+        ttl = (self.valves.PROMPT_CACHE_TTL or "").strip()
+        if ttl:
+            cache_control["ttl"] = ttl
+
+        targets = []
+        last_system = next(
+            (
+                m
+                for m in reversed(messages)
+                if isinstance(m, dict) and m.get("role") == "system"
+            ),
+            None,
+        )
+        if last_system is not None:
+            targets.append(last_system)
+
+        last_message = messages[-1]
+        # ``is`` rather than ``!=``: in a system-only payload the last message
+        # and the last system message are the same object, and marking it
+        # twice would waste a breakpoint.
+        if isinstance(last_message, dict) and last_message is not last_system:
+            targets.append(last_message)
+
+        placed = sum(
+            1 for target in targets if self._mark_cache_breakpoint(target, cache_control)
+        )
+
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print(f"Prompt caching: placed {placed} breakpoint(s) for {model_id}")
 
     def _handle_litellm_error(self, response) -> str:
         """Handle various LiteLLM error responses and format them appropriately."""
@@ -1410,6 +1568,10 @@ class Pipeline:
                     payload["tools"] = non_billing_tools
                 else:
                     payload.pop("tools", None)
+
+            # Anthropic prompt caching. Applied here, after the payload is
+            # final, so the markers land on exactly what gets sent.
+            self._apply_prompt_caching(payload, model_id)
 
             if self.valves.LITELLM_PIPELINE_DEBUG:
                 print("Payload for LiteLLM:")
