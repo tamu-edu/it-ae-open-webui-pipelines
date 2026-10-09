@@ -73,6 +73,18 @@ class Pipeline:
         IMAGE_MODELS: str = ""
         # Default image size sent to LiteLLM when OpenWebUI does not supply one.
         IMAGE_SIZE: str = "1024x1024"
+        # Anthropic prompt caching. Every turn of a chat re-sends the whole
+        # conversation plus any injected knowledge-base context, so without
+        # caching a knowledge-backed assistant re-bills its entire prefix at
+        # full price on every message.
+        PROMPT_CACHING_ENABLED: bool = True
+        # Cache entry lifetime. "5m" is cheaper to write (1.25x vs 2x base) but
+        # only pays off when turns start less than five minutes apart; real
+        # chats routinely pause longer than that, which misses the cache
+        # entirely and re-charges the full prefix. LiteLLM silently drops the
+        # ttl for models whose pricing entry does not advertise extended-TTL
+        # support, so "1h" degrades to the 5m default rather than erroring.
+        PROMPT_CACHE_TTL: str = "1h"
 
     def __init__(self):
         # You can also set the pipelines that are available in this pipeline.
@@ -96,6 +108,11 @@ class Pipeline:
         # pipe() consults this to decide whether to route a request to the image
         # endpoints instead of /v1/chat/completions.
         self.image_model_ids = set()
+
+        # Set of model ids that take explicit Anthropic cache_control markers
+        # (populated by get_litellm_models). Empty until that call succeeds,
+        # which is the safe default: no markers simply means no caching.
+        self.prompt_cache_model_ids = set()
 
         # Initialize rate limits
         self.valves = self.Valves(
@@ -126,6 +143,11 @@ class Pipeline:
                 ),
                 "IMAGE_MODELS": os.getenv("IMAGE_MODELS", ""),
                 "IMAGE_SIZE": os.getenv("IMAGE_SIZE", "1024x1024"),
+                "PROMPT_CACHING_ENABLED": os.getenv(
+                    "PROMPT_CACHING_ENABLED", "true"
+                ).lower()
+                in ["true", "1"],
+                "PROMPT_CACHE_TTL": os.getenv("PROMPT_CACHE_TTL", "1h"),
             }
         )
         # Get models on initialization
@@ -181,21 +203,29 @@ class Pipeline:
         # Auto-detect image models from /model/info by their mode. This is
         # best-effort: if it fails we still serve the full model list from
         # /v1/models below and rely on the valve for image classification.
+        # The same pass records which models accept explicit cache_control.
+        prompt_cache_model_ids = set()
         try:
             r = requests.get(
                 f"{self.valves.LITELLM_BASE_URL}/model/info", headers=headers
             )
             r.raise_for_status()
             for model in r.json().get("data", []):
-                mode = (model.get("model_info") or {}).get("mode")
-                if mode == "image_generation":
-                    model_id = model.get("model_name")
+                model_info = model.get("model_info") or {}
+                model_id = model.get("model_name")
+                if model_info.get("mode") == "image_generation":
                     if model_id:
                         image_model_ids.add(model_id)
+                if model_id and self._accepts_cache_control(model, model_info):
+                    prompt_cache_model_ids.add(model_id)
         except Exception as e:
             print(f"Error fetching /model/info for image detection: {e}")
 
         self.image_model_ids = image_model_ids
+        self.prompt_cache_model_ids = prompt_cache_model_ids
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print("Models accepting explicit cache_control:")
+            pprint(sorted(prompt_cache_model_ids))
         if self.valves.LITELLM_PIPELINE_DEBUG:
             print("Image models detected/overridden:")
             pprint(sorted(image_model_ids))
@@ -224,43 +254,108 @@ class Pipeline:
                 },
             ]
 
+    # How a budget_duration reads in a sentence. LiteLLM accepts values like
+    # "1d"/"7d"/"30d"/"1mo"; anything unrecognised gets wording that does not
+    # promise a reset interval we cannot name.
+    BUDGET_PERIOD_LABELS = {
+        "1d": "daily",
+        "7d": "weekly",
+        "30d": "monthly",
+        "1mo": "monthly",
+    }
+
+    # Amount pairs as LiteLLM writes them, which differs per budget check
+    # (litellm/proxy/auth/auth_checks.py):
+    #   "Current cost: 10.39, Max budget: 10.0"  virtual-key max_budget
+    #   "Spend=12.5, Budget=10.0"                user / end-user budget
+    #   "Spend=$12.3456, Limit=$10.00"           key / team rolling-window budget
+    # The "$" is optional because only the window checks format with one, and
+    # the window checks say "Limit" where the others say "Budget".
+    BUDGET_AMOUNT_PATTERNS = (
+        (r"Current cost: \$?([\d.]+)", r"Max budget: \$?([\d.]+)"),
+        (r"Spend=\$?([\d.]+)", r"(?:Budget|Limit)=\$?([\d.]+)"),
+    )
+
+    # Why every budget message ends with advice: the spend is dominated by input
+    # tokens, and a chat with attached documents re-sends the whole transcript
+    # plus its retrieved context on every single turn. Users read "budget
+    # exceeded" as "I sent too many messages", when the real driver is usually
+    # the size of one long conversation.
+    BUDGET_ADVICE = (
+        "Long conversations use this up quickly, especially ones with attached "
+        "documents or knowledge collections, because the entire conversation is "
+        "re-sent to the model on every turn. Starting a new chat, or using a "
+        "lower-cost model, will stretch your budget further."
+    )
+
+    # A team budget is shared, so nothing the user does on their own necessarily
+    # frees it up and the advice above does not apply to them.
+    SHARED_BUDGET_ADVICE = (
+        "This budget is shared by everyone on your team, so it can run out "
+        "because of other members' usage as well as your own. If you need it "
+        "raised, contact your administrator."
+    )
+
+    def _budget_period_label(self, error_message: str = "") -> str:
+        """Human wording for whichever budget period actually tripped."""
+        # The rolling-window checks name the period in the message itself
+        # ("... over 1d budget"), which is authoritative for the budget that
+        # tripped; the per-user valve is only a fallback for the other checks.
+        match = re.search(r"over (\S+) budget", error_message)
+        period = (
+            match.group(1)
+            if match
+            else (self.valves.LITELLM_USER_BUDGET_PERIOD or "")
+        )
+        return self.BUDGET_PERIOD_LABELS.get(period.strip().lower(), "")
+
     def _format_budget_error(self, error_message: str) -> str:
         """Format budget exceeded error messages in a user-friendly way."""
-        if "ExceededBudget" in error_message:
-            user_spend_match = re.search(r"Spend=([\d.]+)", error_message)
-            user_budget_match = re.search(r"Budget=([\d.]+)", error_message)
+        # "Team=" only appears in the team budget checks; every other check
+        # names a key, a user or an end user, i.e. this user's own budget.
+        shared = "Team=" in error_message
+        period = self._budget_period_label(error_message)
 
-            if user_spend_match and user_budget_match:
-                user_spend = user_spend_match.group(1)
-                user_budget = user_budget_match.group(1)
+        if shared:
+            budget_label = f"shared {period} budget" if period else "shared budget"
+            owner = "your team has"
+            advice = self.SHARED_BUDGET_ADVICE
+        else:
+            budget_label = f"{period} budget" if period else "budget"
+            owner = "you have"
+            advice = self.BUDGET_ADVICE
+
+        reset_hint = (
+            f"This budget resets {period}."
+            if period
+            else "This budget resets at the start of the next budget period."
+        )
+
+        for spend_pattern, budget_pattern in self.BUDGET_AMOUNT_PATTERNS:
+            spend_match = re.search(spend_pattern, error_message)
+            budget_match = re.search(budget_pattern, error_message)
+
+            if spend_match and budget_match:
                 # Built by concatenation rather than a triple-quoted string on
                 # purpose: source indentation inside a triple-quoted literal is
                 # part of the value, and 4+ leading spaces make Markdown render
                 # the whole thing as an indented code block instead of a list.
                 return (
-                    "You have exceeded your daily budget for AI resources:\n"
-                    f"- Your current spend: ${float(user_spend):.2f}\n"
-                    f"- Your daily budget: ${float(user_budget):.2f}"
+                    f"{owner.capitalize()} used the full {budget_label} "
+                    "for AI resources:\n"
+                    f"- Current spend: ${float(spend_match.group(1)):.2f}\n"
+                    f"- Budget: ${float(budget_match.group(1)):.2f}\n"
+                    f"\n{reset_hint} {advice}"
                 )
 
-        elif "Budget has been exceeded!" in error_message:
-            user_spend_match = re.search(r"Current cost: ([\d.]+)", error_message)
-            user_budget_match = re.search(r"Max budget: ([\d.]+)", error_message)
-
-            if user_spend_match and user_budget_match:
-                user_spend = user_spend_match.group(1)
-                user_budget = user_budget_match.group(1)
-                # Built by concatenation rather than a triple-quoted string on
-                # purpose: source indentation inside a triple-quoted literal is
-                # part of the value, and 4+ leading spaces make Markdown render
-                # the whole thing as an indented code block instead of a list.
-                return (
-                    "You have exceeded your daily budget for AI resources:\n"
-                    f"- Your current spend: ${float(user_spend):.2f}\n"
-                    f"- Your daily budget: ${float(user_budget):.2f}"
-                )
-
-        return error_message
+        # Deliberately not echoing `error_message`: LiteLLM embeds the key
+        # owner's address and a key prefix in it ("Key=someone@example.com
+        # (sk-...abcd)"), which does not belong in a chat transcript that the
+        # user may well go on to share.
+        return (
+            f"{owner.capitalize()} used the full {budget_label} for AI "
+            f"resources. {reset_hint} {advice}"
+        )
 
     # Substrings LiteLLM uses for a context-window overflow. The wording differs
     # per provider (OpenAI/Azure, Bedrock/Anthropic, Vertex), so match on any of
@@ -329,6 +424,165 @@ class Pipeline:
 
         return formatted_message
 
+    # Substrings that mark an Anthropic model, whatever route it comes in on:
+    # "anthropic/claude-...", "bedrock/us.anthropic.claude-...",
+    # "vertex_ai/claude-...". Checked against the underlying model rather than
+    # the dropdown alias, because the alias is operator-chosen ("Claude Opus
+    # 4.7", but also "protected.Whatever") and carries no provider guarantee.
+    ANTHROPIC_MODEL_MARKERS = ("anthropic", "claude")
+
+    @classmethod
+    def _accepts_cache_control(cls, model: dict, model_info: dict) -> bool:
+        """Whether this model wants explicit Anthropic cache_control markers.
+
+        Deliberately narrower than model_info's own supports_prompt_caching
+        flag: that is also true for OpenAI models, which cache automatically
+        server-side and have no cache_control field. Sending markers there is
+        at best ignored and at worst a 400, so require both the capability flag
+        and an Anthropic underlying model.
+        """
+        if not model_info.get("supports_prompt_caching"):
+            return False
+        underlying = str((model.get("litellm_params") or {}).get("model") or "").lower()
+        return any(marker in underlying for marker in cls.ANTHROPIC_MODEL_MARKERS)
+
+    @staticmethod
+    def _already_has_cache_control(messages: list) -> bool:
+        """Whether anything upstream already placed a breakpoint."""
+        for message in messages:
+            if not isinstance(message, dict):
+                continue
+            if message.get("cache_control"):
+                return True
+            content = message.get("content")
+            if isinstance(content, list):
+                for block in content:
+                    if isinstance(block, dict) and block.get("cache_control"):
+                        return True
+        return False
+
+    @staticmethod
+    def _mark_cache_breakpoint(message: dict, cache_control: dict) -> bool:
+        """Attach a breakpoint to a message's last cacheable text block.
+
+        Returns whether a marker was placed. A plain string body is promoted to
+        a single text block, which is the form LiteLLM's providers read the
+        marker from and is equivalent for chat completions.
+        """
+        content = message.get("content")
+
+        if isinstance(content, str):
+            if not content.strip():
+                return False
+            message["content"] = [
+                {"type": "text", "text": content, "cache_control": dict(cache_control)}
+            ]
+            return True
+
+        if isinstance(content, list):
+            # Mark the last text block, not simply the last block: a trailing
+            # image or audio part is not a useful breakpoint, and the text that
+            # precedes it is the bulk of the tokens.
+            for block in reversed(content):
+                if (
+                    isinstance(block, dict)
+                    and block.get("type") == "text"
+                    and str(block.get("text") or "").strip()
+                ):
+                    block["cache_control"] = dict(cache_control)
+                    return True
+
+        # Anything else (tool-call-only assistant turns, null content) has no
+        # text to cache.
+        return False
+
+    def _apply_prompt_caching(self, payload: dict, model_id: str) -> None:
+        """Place Anthropic cache breakpoints on a chat-completions payload.
+
+        Two breakpoints, placed at the two boundaries that are actually stable
+        from one turn to the next:
+
+        1. The last system message. OpenWebUI puts the workspace model's system
+           prompt there, and leaves it byte-identical across turns, so it is
+           the large unchanging head of the prefix.
+        2. The last message *before* the final one -- normally the previous
+           assistant turn. This is the end of the conversation history, which
+           does recur verbatim on the next request.
+
+        The final message is deliberately **not** marked, and this is the whole
+        point of the placement. With RAG_SYSTEM_CONTEXT false (the OpenWebUI
+        default, and unset in every environment here) retrieved knowledge-base
+        context is prepended to ``messages[-1]`` at request time and is not
+        persisted, so:
+
+        * it is absent when that same turn is replayed as history next request,
+          and
+        * the chunks are re-ranked against each new question, so even the same
+          chunks arrive in a different order.
+
+        Marking that message would therefore write a large block that can never
+        be read back -- a pure write premium on every turn, measured at ~9.7k
+        tokens on a dev reproduction, which costs more than the system-prompt
+        cache saves. Leaving it unmarked keeps the per-request context after the
+        last breakpoint, where it is billed once at the normal input rate.
+
+        Anthropic allows at most four breakpoints per request; using two leaves
+        room for anything added later. Mutates ``payload`` in place.
+        """
+        if not self.valves.PROMPT_CACHING_ENABLED:
+            return
+        if model_id not in self.prompt_cache_model_ids:
+            return
+
+        messages = payload.get("messages")
+        if not isinstance(messages, list) or not messages:
+            return
+
+        # Respect a caller that has already placed breakpoints rather than
+        # risk exceeding the four-breakpoint limit.
+        if self._already_has_cache_control(messages):
+            return
+
+        cache_control = {"type": "ephemeral"}
+        ttl = (self.valves.PROMPT_CACHE_TTL or "").strip()
+        if ttl:
+            cache_control["ttl"] = ttl
+
+        targets = []
+        last_system = next(
+            (
+                m
+                for m in reversed(messages)
+                if isinstance(m, dict) and m.get("role") == "system"
+            ),
+            None,
+        )
+        if last_system is not None:
+            targets.append(last_system)
+
+        # Everything except the final message, which carries the per-request
+        # context (see the docstring). ``is`` rather than ``!=``: in a payload
+        # whose only history is the system message, the candidate and the system
+        # message are the same object, and marking it twice would waste a
+        # breakpoint.
+        end_of_history = next(
+            (
+                m
+                for m in reversed(messages[:-1])
+                if isinstance(m, dict) and m is not last_system
+            ),
+            None,
+        )
+        if end_of_history is not None:
+            targets.append(end_of_history)
+
+        placed = sum(
+            1 for target in targets if self._mark_cache_breakpoint(target, cache_control)
+        )
+
+        if self.valves.LITELLM_PIPELINE_DEBUG:
+            print(f"Prompt caching: placed {placed} breakpoint(s) for {model_id}")
+
     def _handle_litellm_error(self, response) -> str:
         """Handle various LiteLLM error responses and format them appropriately."""
         try:
@@ -345,20 +599,29 @@ class Pipeline:
         error_type = error_info.get("type", "Service Error")
         # error_code = error_info.get("code", None)
 
+        # Budget exhaustion, checked ahead of every status-code branch on
+        # purpose. LiteLLM's BudgetExceededError hardcodes status_code = 429
+        # (litellm/exceptions.py) and the proxy re-raises it as a
+        # ProxyException with type "budget_exceeded" and that same code. While
+        # this check sat under `status_code == 400` it could never run, so the
+        # 429 branch below caught every out-of-budget user and told them they
+        # were sending requests too fast -- advice that cannot help, since
+        # nothing changes until the budget period rolls over.
+        if (
+            error_type == "budget_exceeded"
+            or "ExceededBudget" in error_message
+            or "Budget has been exceeded!" in error_message
+        ):
+            return self._format_error_response(
+                "Budget Exceeded",
+                self._format_budget_error(error_message),
+                response.status_code,
+            )
+
         ## Handle specific error types with custom formatting
         if response.status_code == 400:
-            # Budget exceeded errors
-            if (
-                "ExceededBudget" in error_message
-                or "Budget has been exceeded!" in error_message
-            ):
-                formatted_budget_error = self._format_budget_error(error_message)
-                return self._format_error_response(
-                    "Budget Exceeded", formatted_budget_error, 400
-                )
-
             # Guardrail responses
-            elif "bedrock_guardrail_response" in json.dumps(res):
+            if "bedrock_guardrail_response" in json.dumps(res):
                 try:
                     error_message = ast.literal_eval(res["error"]["message"])
                     blocked_response = error_message["bedrock_guardrail_response"][
@@ -386,8 +649,11 @@ class Pipeline:
                     400,
                 )
 
-        # Rate limits. Per-user rpm/tpm limits are enforced by LiteLLM, so this is
-        # usually self-inflicted by rapid requests rather than a provider outage.
+        # Genuine rpm/tpm rate limits. Budget exhaustion also arrives as a 429
+        # and is handled above, so do not fold the two together again. Note that
+        # the binding ceiling is not always the user's own: the shared team
+        # tpm_limit can be lower than the per-user one, in which case a handful
+        # of large concurrent requests rate-limits an uninvolved user.
         elif response.status_code == 429:
             return self._format_error_response(
                 "Rate Limit Reached",
@@ -1333,6 +1599,10 @@ class Pipeline:
                     payload["tools"] = non_billing_tools
                 else:
                     payload.pop("tools", None)
+
+            # Anthropic prompt caching. Applied here, after the payload is
+            # final, so the markers land on exactly what gets sent.
+            self._apply_prompt_caching(payload, model_id)
 
             if self.valves.LITELLM_PIPELINE_DEBUG:
                 print("Payload for LiteLLM:")

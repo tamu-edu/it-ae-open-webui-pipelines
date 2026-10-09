@@ -1,0 +1,4 @@
+# Test-only dependencies. The suite deliberately does not need the pipeline's
+# runtime dependencies (fastapi, pydantic, requests, psycopg2) -- tests/conftest.py
+# stubs those, so the unit tests stay fast and offline. See tests/README.md.
+pytest>=8.0.0
