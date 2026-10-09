@@ -499,15 +499,32 @@ class Pipeline:
     def _apply_prompt_caching(self, payload: dict, model_id: str) -> None:
         """Place Anthropic cache breakpoints on a chat-completions payload.
 
-        Two breakpoints, which is what this shape of traffic needs:
+        Two breakpoints, placed at the two boundaries that are actually stable
+        from one turn to the next:
 
         1. The last system message. OpenWebUI puts the workspace model's system
-           prompt there, and injects knowledge-base context into it, so this is
-           the large and mostly unchanging part of the prefix.
-        2. The final message. This is written on the turn it appears and read
-           back on the next one, so the conversation history accumulates as
-           cache hits instead of being re-billed in full each turn. Writes only
-           cover the delta past the previous hit, so the marker is cheap.
+           prompt there, and leaves it byte-identical across turns, so it is
+           the large unchanging head of the prefix.
+        2. The last message *before* the final one -- normally the previous
+           assistant turn. This is the end of the conversation history, which
+           does recur verbatim on the next request.
+
+        The final message is deliberately **not** marked, and this is the whole
+        point of the placement. With RAG_SYSTEM_CONTEXT false (the OpenWebUI
+        default, and unset in every environment here) retrieved knowledge-base
+        context is prepended to ``messages[-1]`` at request time and is not
+        persisted, so:
+
+        * it is absent when that same turn is replayed as history next request,
+          and
+        * the chunks are re-ranked against each new question, so even the same
+          chunks arrive in a different order.
+
+        Marking that message would therefore write a large block that can never
+        be read back -- a pure write premium on every turn, measured at ~9.7k
+        tokens on a dev reproduction, which costs more than the system-prompt
+        cache saves. Leaving it unmarked keeps the per-request context after the
+        last breakpoint, where it is billed once at the normal input rate.
 
         Anthropic allows at most four breakpoints per request; using two leaves
         room for anything added later. Mutates ``payload`` in place.
@@ -543,12 +560,21 @@ class Pipeline:
         if last_system is not None:
             targets.append(last_system)
 
-        last_message = messages[-1]
-        # ``is`` rather than ``!=``: in a system-only payload the last message
-        # and the last system message are the same object, and marking it
-        # twice would waste a breakpoint.
-        if isinstance(last_message, dict) and last_message is not last_system:
-            targets.append(last_message)
+        # Everything except the final message, which carries the per-request
+        # context (see the docstring). ``is`` rather than ``!=``: in a payload
+        # whose only history is the system message, the candidate and the system
+        # message are the same object, and marking it twice would waste a
+        # breakpoint.
+        end_of_history = next(
+            (
+                m
+                for m in reversed(messages[:-1])
+                if isinstance(m, dict) and m is not last_system
+            ),
+            None,
+        )
+        if end_of_history is not None:
+            targets.append(end_of_history)
 
         placed = sum(
             1 for target in targets if self._mark_cache_breakpoint(target, cache_control)

@@ -66,36 +66,36 @@ def breakpoints(payload):
 
 
 class TestPlacement:
-    def test_two_breakpoints_on_system_and_the_newest_turn(self, pipeline):
-        """The stable prefix and the growing tail are the two boundaries.
+    def test_two_breakpoints_on_system_and_end_of_history(self, pipeline):
+        """The two boundaries that actually recur next request.
 
-        System holds the system prompt and injected context. The final message
-        is written this turn and read back on the next, so history accrues as
-        cache hits instead of being re-billed in full.
+        System is byte-stable. The message before the final one is the end of
+        the conversation history, which does reappear verbatim. The final
+        message does not -- see TestFinalMessageIsNeverMarked.
         """
         payload = copy.deepcopy(CONVERSATION)
         pipeline._apply_prompt_caching(payload, MODEL)
 
-        assert [role for role, _ in breakpoints(payload)] == ["system", "user"]
+        assert [role for role, _ in breakpoints(payload)] == ["system", "assistant"]
 
-    def test_the_marked_user_turn_is_the_newest_one(self, pipeline):
+    def test_the_marked_history_message_is_the_last_before_the_final(self, pipeline):
         payload = copy.deepcopy(CONVERSATION)
         pipeline._apply_prompt_caching(payload, MODEL)
 
-        newest = payload["messages"][-1]["content"]
-        assert newest[0]["text"] == "second question"
-        assert newest[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+        marked = payload["messages"][-2]["content"]
+        assert marked[0]["text"] == "first answer"
+        assert marked[0]["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
 
-    def test_intermediate_turns_are_not_marked(self, pipeline):
-        """Anthropic allows four breakpoints; don't spend them on history.
+    def test_earlier_turns_are_not_marked(self, pipeline):
+        """Anthropic allows four breakpoints; don't spend them on old history.
 
-        Earlier turns are already covered by the moving tail marker from the
-        turn on which they were newest.
+        Earlier turns are already covered by the marker placed on the turn when
+        they were the end of history.
         """
         payload = copy.deepcopy(CONVERSATION)
         pipeline._apply_prompt_caching(payload, MODEL)
 
-        for message in payload["messages"][1:-1]:
+        for message in payload["messages"][1:-2]:
             assert not message.get("cache_control")
 
     def test_never_exceeds_the_four_breakpoint_limit(self, pipeline):
@@ -131,18 +131,49 @@ class TestPlacement:
         assert not payload["messages"][0].get("cache_control")
         assert payload["messages"][1]["content"][0].get("cache_control")
 
-    def test_no_system_message_marks_only_the_tail(self, pipeline):
+    def test_a_single_user_message_gets_no_marker(self, pipeline):
+        """Nothing here recurs: it is both the only message and the final one."""
         payload = {"messages": [{"role": "user", "content": "hello"}]}
         pipeline._apply_prompt_caching(payload, MODEL)
 
-        assert [role for role, _ in breakpoints(payload)] == ["user"]
+        assert breakpoints(payload) == []
 
     def test_a_system_only_payload_is_marked_once(self, pipeline):
-        """System and tail are the same object here; marking twice wastes one."""
+        """System and end-of-history are the same object; don't double-mark."""
         payload = {"messages": [{"role": "system", "content": "sys prompt"}]}
         pipeline._apply_prompt_caching(payload, MODEL)
 
         assert len(breakpoints(payload)) == 1
+
+
+class TestFinalMessageIsNeverMarked:
+    """The regression this placement exists to avoid.
+
+    OpenWebUI prepends retrieved knowledge-base context to messages[-1] at
+    request time (RAG_SYSTEM_CONTEXT defaults false) and does not persist it,
+    and it re-ranks the chunks against each new question. So that block never
+    recurs: marking it writes tokens at the cache-write premium that can never
+    be read back, which on a dev reproduction cost more than the system-prompt
+    cache saved.
+    """
+
+    def test_a_final_user_turn_carrying_rag_context_is_not_marked(self, pipeline):
+        payload = {
+            "messages": [
+                {"role": "system", "content": "stable system prompt"},
+                {"role": "user", "content": "earlier question"},
+                {"role": "assistant", "content": "earlier answer"},
+                {"role": "user", "content": "<context>...chunks...</context>\n\nnew question"},
+            ]
+        }
+        pipeline._apply_prompt_caching(payload, MODEL)
+
+        roles = [role for role, _ in breakpoints(payload)]
+        assert roles == ["system", "assistant"]
+        assert not payload["messages"][-1].get("cache_control")
+        assert isinstance(payload["messages"][-1]["content"], str), (
+            "the final message must be left untouched, not even promoted to blocks"
+        )
 
 
 class TestMultimodalContent:
@@ -161,13 +192,38 @@ class TestMultimodalContent:
                         },
                     ],
                 },
+                {"role": "assistant", "content": "an answer"},
+                {"role": "user", "content": "follow-up"},
             ]
         }
         pipeline._apply_prompt_caching(payload, MODEL)
 
-        blocks = payload["messages"][-1]["content"]
-        assert blocks[0].get("cache_control")
+        blocks = payload["messages"][1]["content"]
+        assert blocks[0].get("cache_control") is None
         assert not blocks[1].get("cache_control")
+
+    def test_marker_lands_on_a_multimodal_history_turn_text_block(self, pipeline):
+        payload = {
+            "messages": [
+                {"role": "system", "content": "sys"},
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "describe this"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAAA"},
+                        },
+                    ],
+                },
+                {"role": "user", "content": "follow-up"},
+            ]
+        }
+        pipeline._apply_prompt_caching(payload, MODEL)
+
+        blocks = payload["messages"][1]["content"]
+        assert blocks[0].get("cache_control"), "text block should carry the marker"
+        assert not blocks[1].get("cache_control"), "image block should not"
 
 
 class TestWhenToKeepHandsOff:
@@ -203,7 +259,7 @@ class TestWhenToKeepHandsOff:
         assert payload == prepared
 
     def test_content_with_no_cacheable_text_is_skipped(self, pipeline):
-        """A tool-call-only assistant turn has nothing to cache."""
+        """A tool-call-only assistant turn in history has nothing to cache."""
         payload = {
             "messages": [
                 {"role": "system", "content": "sys"},
@@ -218,6 +274,7 @@ class TestWhenToKeepHandsOff:
                         }
                     ],
                 },
+                {"role": "user", "content": "next question"},
             ]
         }
         pipeline._apply_prompt_caching(payload, MODEL)
@@ -230,6 +287,7 @@ class TestWhenToKeepHandsOff:
             "messages": [
                 {"role": "system", "content": "   "},
                 {"role": "user", "content": ""},
+                {"role": "user", "content": "final"},
             ]
         }
         pipeline._apply_prompt_caching(payload, MODEL)
