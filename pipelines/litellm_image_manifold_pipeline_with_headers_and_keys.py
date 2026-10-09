@@ -143,6 +143,11 @@ class Pipeline:
                 ),
                 "IMAGE_MODELS": os.getenv("IMAGE_MODELS", ""),
                 "IMAGE_SIZE": os.getenv("IMAGE_SIZE", "1024x1024"),
+                "PROMPT_CACHING_ENABLED": os.getenv(
+                    "PROMPT_CACHING_ENABLED", "true"
+                ).lower()
+                in ["true", "1"],
+                "PROMPT_CACHE_TTL": os.getenv("PROMPT_CACHE_TTL", "1h"),
             }
         )
         # Get models on initialization
